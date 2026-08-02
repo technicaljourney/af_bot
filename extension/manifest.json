@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Pluto Token Bridge",
+  "version": "1.0.0",
+  "description": "Forwards your AfterQuery auth token to the Pluto Submissions app and keeps it fresh.",
+  "permissions": ["webRequest", "storage", "alarms"],
+  "host_permissions": [
+    "https://experts.afterquery.com/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://experts.afterquery.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Pluto Token Bridge"
+  }
+}

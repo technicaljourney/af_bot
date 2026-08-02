@@ -1,0 +1,841 @@
+"use client";
+
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+
+/**
+ * Gold project tab.
+ *
+ * Repo → task tree. Repos are the folders under GOLD_DIR/result/; a ▸/▾ triangle
+ * before the repo name expands it to show its tasks (result/<repo>/tasks/).
+ * A repo's data.txt gives its repo_url; we cross-check gold.repos.list:
+ *   - NOT connected → "Connect repo" in the Action column.
+ *   - connected     → each task row gets an "Add environment" button.
+ *
+ * `manualToken` matches the other tabs: the pasted Bearer token from the auth
+ * bar (empty string when the extension/refresh-token is used).
+ */
+
+interface RepoRow {
+  name: string;
+  modifiedMs: number;
+  hasStatus: boolean;
+  taskCount: number;
+  repoUrl: string | null;
+  repository: string | null;
+  cloneUrl: string | null;
+  defaultBranch: string | null;
+}
+
+interface GoldEnvironment {
+  baseSha: string;
+  status: string;
+  version?: number;
+  imageRef?: string;
+}
+
+interface ConnectedRepo {
+  id?: string;
+  repoUrl: string;
+  status?: string;
+  environmentCount: number;
+  environments: GoldEnvironment[];
+  language?: string;
+}
+
+interface TaskItem {
+  name: string;
+  modifiedMs: number;
+  baseCommit: string | null;
+  taskName: string;
+}
+
+interface PipelineStep {
+  key: string;
+  label: string;
+  status: string; // passed | running | failed | pending
+}
+
+interface MyTask {
+  id?: string;
+  taskName: string;
+  repoId: string;
+  baseSha?: string;
+  status?: string;
+  environmentVersion?: number;
+  steps: PipelineStep[];
+  pipelineDone: boolean;
+  failedStage: string | null;
+}
+
+/** A task is mid-validation while its status is "Validating" and not finished. */
+function isValidating(t?: MyTask): boolean {
+  return Boolean(t && t.status === "Validating" && !t.pipelineDone);
+}
+
+/** Horizontal 8-segment pipeline progress bar with a caption. */
+function PipelineProgress({ steps }: { steps: PipelineStep[] }) {
+  if (!steps || steps.length === 0) return null;
+  const passed = steps.filter((s) => s.status === "passed").length;
+  const running = steps.find((s) => s.status === "running");
+  const failed = steps.find((s) => s.status === "failed");
+  const caption = failed
+    ? `Failed: ${failed.label}`
+    : running
+    ? `${running.label}… (${passed}/${steps.length})`
+    : `${passed}/${steps.length}`;
+  return (
+    <div className="mt-1 w-full max-w-[260px]">
+      <div className="flex gap-0.5">
+        {steps.map((s) => (
+          <div
+            key={s.key}
+            title={`${s.label}: ${s.status}`}
+            className={`h-1.5 flex-1 rounded-full ${
+              s.status === "passed"
+                ? "bg-emerald-500"
+                : s.status === "failed"
+                ? "bg-red-500"
+                : s.status === "running"
+                ? "animate-pulse bg-violet-500"
+                : "bg-neutral-700"
+            }`}
+          />
+        ))}
+      </div>
+      <div
+        className={`mt-0.5 text-[10px] ${failed ? "text-red-400" : "text-neutral-500"}`}
+      >
+        {caption}
+      </div>
+    </div>
+  );
+}
+
+type ConnectState = "idle" | "connecting" | "error";
+type EnvState = "none" | "building" | "published";
+
+/** Environment state for a task's base_commit within a connected repo. */
+function envStateFor(conn: ConnectedRepo | undefined, baseCommit: string | null): EnvState {
+  if (!conn || !baseCommit) return "none";
+  const bc = baseCommit.toLowerCase();
+  const matches = conn.environments.filter((e) => e.baseSha.toLowerCase() === bc);
+  if (matches.some((e) => e.status === "published")) return "published";
+  if (matches.length > 0) return "building"; // exists but not yet published
+  return "none";
+}
+
+/** Highest published environment version for a task's base_commit (or null). */
+function publishedEnvVersion(
+  conn: ConnectedRepo | undefined,
+  baseCommit: string | null
+): number | null {
+  if (!conn || !baseCommit) return null;
+  const bc = baseCommit.toLowerCase();
+  const versions = conn.environments
+    .filter(
+      (e) => e.baseSha.toLowerCase() === bc && e.status === "published" && typeof e.version === "number"
+    )
+    .map((e) => e.version as number);
+  return versions.length ? Math.max(...versions) : null;
+}
+
+function fmtDate(ms: number): string {
+  if (!ms) return "—";
+  return new Date(ms).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Normalize a repo URL for matching (lowercase, drop .git and trailing slash). */
+function normUrl(u: string | null): string {
+  return (u || "").trim().toLowerCase().replace(/\.git$/, "").replace(/\/+$/, "");
+}
+
+export default function Gold({ manualToken }: { manualToken: string }) {
+  const [dir, setDir] = useState("");
+  const [repos, setRepos] = useState<RepoRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+  const [search, setSearch] = useState("");
+
+  const [connected, setConnected] = useState<Map<string, ConnectedRepo>>(new Map());
+  const [connectedErr, setConnectedErr] = useState("");
+
+  const [connectState, setConnectState] = useState<Record<string, ConnectState>>({});
+  const [connectMsg, setConnectMsg] = useState<Record<string, string>>({});
+
+  // Which repos are expanded + their loaded task lists, keyed by repo folder name.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [tasks, setTasks] = useState<Record<string, TaskItem[]>>({});
+  const [tasksLoading, setTasksLoading] = useState<Record<string, boolean>>({});
+  const [tasksErr, setTasksErr] = useState<Record<string, string>>({});
+  const [envMsg, setEnvMsg] = useState<Record<string, string>>({}); // keyed `repo::task`
+  const [submitting, setSubmitting] = useState<Set<string>>(new Set()); // task keys mid-submit
+  const [creating, setCreating] = useState<Set<string>>(new Set()); // task keys mid new-task
+  const [validating, setValidating] = useState<Set<string>>(new Set()); // task keys mid submit
+  const [deleting, setDeleting] = useState<Set<string>>(new Set()); // task keys mid delete
+  // Created tasks keyed by `${repoId}::${taskName}` (from gold.tasks.listMine).
+  const [myTasks, setMyTasks] = useState<Map<string, MyTask>>(new Map());
+
+  const loadRepos = useCallback(async () => {
+    setLoading(true);
+    setErr("");
+    try {
+      const res = await fetch("/api/gold/list", { cache: "no-store" });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Failed to load Gold repos");
+      setDir(data.dir);
+      setRepos(data.repos);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const loadConnected = useCallback(async () => {
+    setConnectedErr("");
+    try {
+      const res = await fetch("/api/gold/connected", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: manualToken }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Failed to load connected repos");
+      const map = new Map<string, ConnectedRepo>();
+      // Only status === "Connected" counts as connected. Skip Rejected/other
+      // states so those repos fall back to "Connect repo" (retry). A Connected
+      // entry always wins over a same-URL non-connected one.
+      for (const r of data.repos as ConnectedRepo[]) {
+        if (r.status === "Connected") map.set(normUrl(r.repoUrl), r);
+      }
+      setConnected(map);
+    } catch (e) {
+      setConnectedErr((e as Error).message);
+    }
+  }, [manualToken]);
+
+  const loadMyTasks = useCallback(async () => {
+    try {
+      const res = await fetch("/api/gold/my-tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: manualToken }),
+      });
+      const data = await res.json();
+      if (!data.ok) return; // silent — connected warning already covers auth issues
+      const map = new Map<string, MyTask>();
+      for (const t of data.tasks as MyTask[]) map.set(`${t.repoId}::${t.taskName}`, t);
+      setMyTasks(map);
+    } catch {
+      /* ignore */
+    }
+  }, [manualToken]);
+
+  const loadTasks = useCallback(async (repoName: string) => {
+    setTasksLoading((s) => ({ ...s, [repoName]: true }));
+    setTasksErr((s) => ({ ...s, [repoName]: "" }));
+    try {
+      const res = await fetch(`/api/gold/tasks?repo=${encodeURIComponent(repoName)}`, {
+        cache: "no-store",
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Failed to load tasks");
+      setTasks((s) => ({ ...s, [repoName]: data.tasks }));
+    } catch (e) {
+      setTasksErr((s) => ({ ...s, [repoName]: (e as Error).message }));
+    } finally {
+      setTasksLoading((s) => ({ ...s, [repoName]: false }));
+    }
+  }, []);
+
+  useEffect(() => {
+    loadRepos();
+  }, [loadRepos]);
+
+  useEffect(() => {
+    loadConnected();
+  }, [loadConnected]);
+
+  useEffect(() => {
+    loadMyTasks();
+  }, [loadMyTasks]);
+
+  const toggleExpand = useCallback(
+    (repoName: string) => {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(repoName)) {
+          next.delete(repoName);
+        } else {
+          next.add(repoName);
+          if (!tasks[repoName]) loadTasks(repoName);
+        }
+        return next;
+      });
+    },
+    [tasks, loadTasks]
+  );
+
+  const connect = useCallback(
+    async (repoUrl: string) => {
+      setConnectState((s) => ({ ...s, [repoUrl]: "connecting" }));
+      setConnectMsg((m) => ({ ...m, [repoUrl]: "" }));
+      try {
+        const res = await fetch("/api/gold/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ repoUrl, token: manualToken }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "Connect failed");
+        setConnectState((s) => ({ ...s, [repoUrl]: "idle" }));
+        await loadConnected();
+      } catch (e) {
+        setConnectState((s) => ({ ...s, [repoUrl]: "error" }));
+        setConnectMsg((m) => ({ ...m, [repoUrl]: (e as Error).message }));
+      }
+    },
+    [manualToken, loadConnected]
+  );
+
+  const addEnvironment = useCallback(
+    async (repoName: string, repoId: string | undefined, task: TaskItem) => {
+      const key = `${repoName}::${task.name}`;
+      if (!repoId) {
+        setEnvMsg((m) => ({ ...m, [key]: "Missing repoId (repo not connected?)." }));
+        return;
+      }
+      setSubmitting((s) => new Set(s).add(key));
+      setEnvMsg((m) => ({ ...m, [key]: "" }));
+      try {
+        const res = await fetch("/api/gold/add-environment", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ repo: repoName, task: task.name, repoId, token: manualToken }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "Add environment failed");
+        setEnvMsg((m) => ({ ...m, [key]: "Building environment…" }));
+        await loadConnected(); // pick up the new "building" environment
+      } catch (e) {
+        setSubmitting((s) => {
+          const next = new Set(s);
+          next.delete(key);
+          return next;
+        });
+        setEnvMsg((m) => ({ ...m, [key]: (e as Error).message }));
+      }
+    },
+    [manualToken, loadConnected]
+  );
+
+  const newTask = useCallback(
+    async (repoName: string, conn: ConnectedRepo | undefined, task: TaskItem) => {
+      const key = `${repoName}::${task.name}`;
+      if (!conn?.id) {
+        setEnvMsg((m) => ({ ...m, [key]: "Missing repoId (repo not connected?)." }));
+        return;
+      }
+      const version = publishedEnvVersion(conn, task.baseCommit);
+      if (version == null) {
+        setEnvMsg((m) => ({ ...m, [key]: "No published environment version found." }));
+        return;
+      }
+      setCreating((s) => new Set(s).add(key));
+      setEnvMsg((m) => ({ ...m, [key]: "" }));
+      try {
+        const res = await fetch("/api/gold/new-task", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            repo: repoName,
+            task: task.name,
+            repoId: conn.id,
+            environmentVersion: version,
+            token: manualToken,
+          }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "New task failed");
+        setEnvMsg((m) => ({ ...m, [key]: "Task created ✓" }));
+        await loadMyTasks(); // flip to "Submit for validation"
+      } catch (e) {
+        setEnvMsg((m) => ({ ...m, [key]: (e as Error).message }));
+      } finally {
+        setCreating((s) => {
+          const next = new Set(s);
+          next.delete(key);
+          return next;
+        });
+      }
+    },
+    [manualToken, loadMyTasks]
+  );
+
+  const submitForValidation = useCallback(
+    async (repoName: string, conn: ConnectedRepo | undefined, task: TaskItem, myTask: MyTask) => {
+      const key = `${repoName}::${task.name}`;
+      if (!myTask?.id) {
+        setEnvMsg((m) => ({ ...m, [key]: "Missing task id." }));
+        return;
+      }
+      // Docker image comes from the published environment for this base_commit.
+      const bc = (task.baseCommit || "").toLowerCase();
+      const env =
+        conn?.environments.find((e) => e.baseSha.toLowerCase() === bc && e.status === "published") ||
+        conn?.environments.find((e) => e.baseSha.toLowerCase() === bc);
+      setValidating((s) => new Set(s).add(key));
+      setEnvMsg((m) => ({ ...m, [key]: "" }));
+      try {
+        const res = await fetch("/api/gold/submit-validation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            repo: repoName,
+            task: task.name,
+            submissionId: myTask.id,
+            dockerImage: env?.imageRef || "",
+            language: conn?.language || "",
+            token: manualToken,
+          }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "Submit failed");
+        if (data.submitted) {
+          setEnvMsg((m) => ({ ...m, [key]: "Submitted for validation ✓" }));
+        } else {
+          const failed = (data.rules || [])
+            .filter((r: { pass: boolean }) => !r.pass)
+            .map((r: { name: string; actual: number }) => `${r.name}=${r.actual}`);
+          setEnvMsg((m) => ({
+            ...m,
+            [key]: `Saved, but rules not met: ${failed.join(", ")}`,
+          }));
+        }
+        await loadMyTasks();
+      } catch (e) {
+        setEnvMsg((m) => ({ ...m, [key]: (e as Error).message }));
+      } finally {
+        setValidating((s) => {
+          const next = new Set(s);
+          next.delete(key);
+          return next;
+        });
+      }
+    },
+    [manualToken, loadMyTasks]
+  );
+
+  // Clear the transient "submitting" flag once the server reflects the env
+  // (building or published) for that task.
+  useEffect(() => {
+    setSubmitting((prev) => {
+      if (prev.size === 0) return prev;
+      const next = new Set(prev);
+      for (const key of prev) {
+        const [repoName, taskName] = key.split("::");
+        const repo = repos.find((r) => r.name === repoName);
+        const conn = repo?.repoUrl ? connected.get(normUrl(repo.repoUrl)) : undefined;
+        const t = tasks[repoName]?.find((x) => x.name === taskName);
+        if (t && envStateFor(conn, t.baseCommit) !== "none") next.delete(key);
+      }
+      return next.size === prev.size ? prev : next;
+    });
+  }, [connected, tasks, repos]);
+
+  // Poll the connected list while any environment is building.
+  const anyBuilding = useMemo(() => {
+    if (submitting.size > 0) return true;
+    for (const [repoName, list] of Object.entries(tasks)) {
+      const repo = repos.find((r) => r.name === repoName);
+      const conn = repo?.repoUrl ? connected.get(normUrl(repo.repoUrl)) : undefined;
+      if (!conn) continue;
+      for (const t of list) if (envStateFor(conn, t.baseCommit) === "building") return true;
+    }
+    return false;
+  }, [submitting, tasks, repos, connected]);
+
+  useEffect(() => {
+    if (!anyBuilding) return;
+    const id = setInterval(loadConnected, 10_000);
+    return () => clearInterval(id);
+  }, [anyBuilding, loadConnected]);
+
+  // Poll my-tasks while any task is validating, so the step progress updates.
+  const anyValidating = useMemo(() => {
+    if (validating.size > 0) return true;
+    for (const t of myTasks.values()) if (isValidating(t)) return true;
+    return false;
+  }, [validating, myTasks]);
+
+  useEffect(() => {
+    if (!anyValidating) return;
+    const id = setInterval(loadMyTasks, 10_000);
+    return () => clearInterval(id);
+  }, [anyValidating, loadMyTasks]);
+
+  const deleteTask = useCallback(
+    async (repoName: string, task: TaskItem, myTask: MyTask) => {
+      const key = `${repoName}::${task.name}`;
+      if (!myTask?.id) {
+        setEnvMsg((m) => ({ ...m, [key]: "Missing task id." }));
+        return;
+      }
+      setDeleting((s) => new Set(s).add(key));
+      setEnvMsg((m) => ({ ...m, [key]: "" }));
+      try {
+        const res = await fetch("/api/gold/delete-task", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ submissionId: myTask.id, token: manualToken }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "Delete failed");
+        setEnvMsg((m) => ({ ...m, [key]: "Deleted ✓" }));
+        await loadMyTasks(); // task gone → row returns to Add environment
+      } catch (e) {
+        setEnvMsg((m) => ({ ...m, [key]: (e as Error).message }));
+      } finally {
+        setDeleting((s) => {
+          const next = new Set(s);
+          next.delete(key);
+          return next;
+        });
+      }
+    },
+    [manualToken, loadMyTasks]
+  );
+
+  const q = search.trim().toLowerCase();
+  const filtered = q ? repos.filter((r) => r.name.toLowerCase().includes(q)) : repos;
+
+  return (
+    <div>
+      <header className="mb-4">
+        <h2 className="text-lg font-semibold text-amber-300">Gold — Repos</h2>
+        {dir && (
+          <p className="mt-1 text-xs text-neutral-500">
+            Reading repos from <code>{dir}</code> · {connected.size} connected on AfterQuery
+          </p>
+        )}
+      </header>
+
+      <section className="mb-3 flex flex-wrap items-center gap-3">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search repo…"
+          className="min-w-[220px] flex-1 rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-amber-600"
+        />
+        <button
+          onClick={() => {
+            loadRepos();
+            loadConnected();
+            loadMyTasks();
+          }}
+          className="rounded border border-neutral-700 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
+        >
+          Reload
+        </button>
+      </section>
+
+      {err && (
+        <div className="mb-4 rounded border border-red-800 bg-red-950 px-3 py-2 text-sm text-red-300">
+          {err}
+        </div>
+      )}
+      {connectedErr && (
+        <div className="mb-4 rounded border border-amber-800 bg-amber-950 px-3 py-2 text-xs text-amber-300">
+          Couldn&apos;t load connected repos: {connectedErr} (Connect state may be stale — needs a
+          Gold-authorized token.)
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded-lg border border-neutral-800">
+        <table className="w-full border-collapse text-sm">
+          <thead>
+            <tr className="border-b border-neutral-800 bg-neutral-900 text-left text-xs uppercase tracking-wide text-neutral-500">
+              <th className="px-3 py-2">Repo / Task</th>
+              <th className="px-3 py-2">Tasks</th>
+              <th className="px-3 py-2">STATUS.md</th>
+              <th className="px-3 py-2">Modified</th>
+              <th className="px-3 py-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading ? (
+              <tr>
+                <td colSpan={5} className="px-3 py-6 text-center text-neutral-500">
+                  Loading…
+                </td>
+              </tr>
+            ) : filtered.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="px-3 py-6 text-center text-neutral-500">
+                  {repos.length === 0 ? "No repos in result/." : "No repos match."}
+                </td>
+              </tr>
+            ) : (
+              filtered.map((r) => {
+                const conn = r.repoUrl ? connected.get(normUrl(r.repoUrl)) : undefined;
+                const isConnected = Boolean(conn);
+                const isOpen = expanded.has(r.name);
+                const canExpand = r.taskCount > 0;
+                const state: ConnectState = r.repoUrl
+                  ? connectState[r.repoUrl] ?? "idle"
+                  : "idle";
+                return (
+                  <Fragment key={r.name}>
+                    <tr
+                      onClick={() => canExpand && toggleExpand(r.name)}
+                      className={`border-b border-neutral-900 align-top hover:bg-neutral-900/50 ${
+                        canExpand ? "cursor-pointer" : ""
+                      }`}
+                    >
+                      <td className="px-3 py-2">
+                        <div className="flex items-start gap-1.5">
+                          <span
+                            className="mt-0.5 w-4 shrink-0 text-neutral-500"
+                            aria-hidden="true"
+                          >
+                            {canExpand ? (isOpen ? "▾" : "▸") : ""}
+                          </span>
+                          <div>
+                            <span className="font-medium text-neutral-200">📁 {r.name}</span>
+                            {r.repository && (
+                              <div className="pl-5 text-xs text-neutral-500">{r.repository}</div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 text-xs text-neutral-400">{r.taskCount || "—"}</td>
+                      <td className="px-3 py-2 text-xs">
+                        {r.hasStatus ? (
+                          <span className="text-emerald-400">✓</span>
+                        ) : (
+                          <span className="text-neutral-600">—</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-xs text-neutral-400">{fmtDate(r.modifiedMs)}</td>
+                      <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
+                        {!r.repoUrl ? (
+                          <span className="text-xs text-neutral-600">no repo_url</span>
+                        ) : isConnected ? (
+                          <span className="text-xs text-emerald-400">✓ connected</span>
+                        ) : (
+                          <div className="flex flex-col gap-1">
+                            <button
+                              onClick={() => connect(r.repoUrl!)}
+                              disabled={state === "connecting"}
+                              title={r.repoUrl}
+                              className="rounded bg-amber-600 px-3 py-1 text-xs font-medium text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {state === "connecting" ? "Connecting…" : "Connect repo"}
+                            </button>
+                            {state === "error" && connectMsg[r.repoUrl] && (
+                              <span className="max-w-[220px] break-words text-[10px] text-red-400">
+                                {connectMsg[r.repoUrl]}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+
+                    {isOpen &&
+                      (tasksLoading[r.name] ? (
+                        <tr className="border-b border-neutral-900 bg-neutral-950/40">
+                          <td colSpan={5} className="px-3 py-2 pl-10 text-xs text-neutral-500">
+                            Loading tasks…
+                          </td>
+                        </tr>
+                      ) : tasksErr[r.name] ? (
+                        <tr className="border-b border-neutral-900 bg-neutral-950/40">
+                          <td colSpan={5} className="px-3 py-2 pl-10 text-xs text-red-400">
+                            {tasksErr[r.name]}
+                          </td>
+                        </tr>
+                      ) : !tasks[r.name] || tasks[r.name].length === 0 ? (
+                        <tr className="border-b border-neutral-900 bg-neutral-950/40">
+                          <td colSpan={5} className="px-3 py-2 pl-10 text-xs text-neutral-500">
+                            No tasks.
+                          </td>
+                        </tr>
+                      ) : (
+                        tasks[r.name].map((t) => {
+                          const key = `${r.name}::${t.name}`;
+                          const serverState = envStateFor(conn, t.baseCommit);
+                          // Treat a just-submitted task as building until the
+                          // server reflects it.
+                          const envState: EnvState =
+                            submitting.has(key) && serverState === "none"
+                              ? "building"
+                              : serverState;
+                          const myTask = conn?.id
+                            ? myTasks.get(`${conn.id}::${t.taskName}`)
+                            : undefined;
+                          // base_commit in task.toml.lines.txt changed after the
+                          // task was created → offer to delete the stale task.
+                          const baseChanged = Boolean(
+                            myTask &&
+                              t.baseCommit &&
+                              myTask.baseSha &&
+                              myTask.baseSha.toLowerCase() !== t.baseCommit.toLowerCase()
+                          );
+                          return (
+                            <tr
+                              key={key}
+                              className="border-b border-neutral-900 bg-neutral-950/40 hover:bg-neutral-900/40"
+                            >
+                              <td className="px-3 py-1.5">
+                                <span className="whitespace-nowrap pl-6 text-neutral-300">
+                                  <span className="text-neutral-600">└ </span>📄 {t.name}
+                                  {t.baseCommit && (
+                                    <span className="ml-2 text-[10px] text-neutral-600">
+                                      @{t.baseCommit.slice(0, 7)}
+                                    </span>
+                                  )}
+                                </span>
+                              </td>
+                              <td className="px-3 py-1.5"></td>
+                              <td className="px-3 py-1.5">
+                                {myTask && <PipelineProgress steps={myTask.steps} />}
+                              </td>
+                              <td className="px-3 py-1.5 text-xs text-neutral-500">
+                                {fmtDate(t.modifiedMs)}
+                              </td>
+                              <td className="px-3 py-1.5">
+                                {!isConnected ? (
+                                  <span className="text-[10px] text-neutral-600">
+                                    connect repo first
+                                  </span>
+                                ) : (
+                                  <div className="flex flex-col gap-1">
+                                    {myTask ? (
+                                      baseChanged ? (
+                                        <div className="flex max-w-[260px] flex-col gap-1">
+                                          {deleting.has(key) ? (
+                                            <button
+                                              disabled
+                                              className="inline-flex cursor-not-allowed items-center gap-1.5 rounded border border-neutral-700 bg-neutral-900 px-3 py-1 text-xs font-medium text-neutral-300"
+                                            >
+                                              <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-neutral-600 border-t-red-400" />
+                                              Deleting…
+                                            </button>
+                                          ) : (
+                                            <button
+                                              onClick={() => deleteTask(r.name, t, myTask)}
+                                              className="rounded bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-500"
+                                            >
+                                              Delete
+                                            </button>
+                                          )}
+                                          <span className="text-[10px] leading-snug text-amber-400">
+                                            base_commit changed:{" "}
+                                            <span className="text-neutral-400">
+                                              {myTask.baseSha?.slice(0, 7)} → {t.baseCommit?.slice(0, 7)}
+                                            </span>
+                                            . This task was created and its environment built against
+                                            the old commit, so it no longer matches. Delete it, then
+                                            re-run Add environment → New task for the new base_commit.
+                                          </span>
+                                        </div>
+                                      ) : validating.has(key) || isValidating(myTask) ? (
+                                        <button
+                                          disabled
+                                          title="Validating…"
+                                          className="inline-flex cursor-not-allowed items-center gap-1.5 rounded border border-neutral-700 bg-neutral-900 px-3 py-1 text-xs font-medium text-neutral-300"
+                                        >
+                                          <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-neutral-600 border-t-violet-400" />
+                                          Validating…
+                                        </button>
+                                      ) : myTask.failedStage || /fail/i.test(myTask.status || "") ? (
+                                        <button
+                                          onClick={() => submitForValidation(r.name, conn, t, myTask)}
+                                          title="Validation failed — save files + submit again"
+                                          className="rounded bg-violet-600 px-3 py-1 text-xs font-medium text-white hover:bg-violet-500"
+                                        >
+                                          Submit for validation
+                                        </button>
+                                      ) : myTask.status && myTask.status !== "Draft" ? (
+                                        <span className="text-xs font-medium text-emerald-400">
+                                          {myTask.status}
+                                        </span>
+                                      ) : (
+                                        <button
+                                          onClick={() => submitForValidation(r.name, conn, t, myTask)}
+                                          title="Save files + submit for validation"
+                                          className="rounded bg-violet-600 px-3 py-1 text-xs font-medium text-white hover:bg-violet-500"
+                                        >
+                                          Submit for validation
+                                        </button>
+                                      )
+                                    ) : creating.has(key) ? (
+                                      <button
+                                        disabled
+                                        title="Creating task…"
+                                        className="inline-flex cursor-not-allowed items-center gap-1.5 rounded border border-neutral-700 bg-neutral-900 px-3 py-1 text-xs font-medium text-neutral-300"
+                                      >
+                                        <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-neutral-600 border-t-emerald-400" />
+                                        Creating…
+                                      </button>
+                                    ) : envState === "published" ? (
+                                      <button
+                                        onClick={() => newTask(r.name, conn, t)}
+                                        title="Environment published for this base_commit"
+                                        className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-500"
+                                      >
+                                        New task
+                                      </button>
+                                    ) : envState === "building" ? (
+                                      <button
+                                        disabled
+                                        title="Building environment…"
+                                        className="inline-flex cursor-not-allowed items-center gap-1.5 rounded border border-neutral-700 bg-neutral-900 px-3 py-1 text-xs font-medium text-neutral-300"
+                                      >
+                                        <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-neutral-600 border-t-sky-400" />
+                                        Building…
+                                      </button>
+                                    ) : (
+                                      <button
+                                        onClick={() => addEnvironment(r.name, conn?.id, t)}
+                                        disabled={!t.baseCommit}
+                                        title={t.baseCommit ? "Build environment for this base_commit" : "No base_commit found"}
+                                        className="rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
+                                      >
+                                        Add environment
+                                      </button>
+                                    )}
+                                    {envMsg[key] && (
+                                      <span className="max-w-[240px] break-words text-[10px] text-neutral-400">
+                                        {envMsg[key]}
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      ))}
+                  </Fragment>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="mt-3 text-xs text-neutral-600">
+        {filtered.length} of {repos.length} repo{repos.length === 1 ? "" : "s"} ·{" "}
+        auth: {manualToken.trim() ? "manual token present" : "using extension / refresh token"}
+      </p>
+    </div>
+  );
+}

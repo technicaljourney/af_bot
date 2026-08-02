@@ -1,0 +1,11 @@
+# dependencies / build
+node_modules/
+.next/
+*.tsbuildinfo
+
+# secrets — never commit
+.env.local
+.auth-store.json
+
+# auto-submit ledger — local record of what has been submitted
+.auto-submit-log.json
