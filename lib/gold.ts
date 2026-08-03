@@ -284,7 +284,7 @@ export const GOLD_STEP_DEFS: Array<{ key: string; label: string }> = [
   { key: "qualityCheck", label: "Quality review" },
   { key: "easinessProbe", label: "Calibration I" },
   { key: "difficultyProbe", label: "Calibration II" },
-  { key: "audit", label: "Run audit" },
+  { key: "failureValidation", label: "Run audit" },
 ];
 
 /** Derive the 8 ordered steps + their status from a task's `pipeline` object. */
