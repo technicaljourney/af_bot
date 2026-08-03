@@ -204,6 +204,17 @@ function normUrl(u: string | null): string {
 /** AfterQuery task page URL for a created task id. */
 const taskUrl = (id: string) => `https://experts.afterquery.com/projects/gold/tasks/${id}`;
 
+/** Filter-board categories, mapped to a task's current action state. */
+const TASK_FILTERS: { key: string; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "needs-review", label: "Needs review" },
+  { key: "updating", label: "Updating" },
+  { key: "validating", label: "Validating" },
+  { key: "submit", label: "Submit for validation" },
+  { key: "building", label: "Building" },
+  { key: "new-task", label: "New task" },
+];
+
 export default function Gold({ manualToken }: { manualToken: string }) {
   const [dir, setDir] = useState("");
   const [repos, setRepos] = useState<RepoRow[]>([]);
@@ -231,6 +242,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   const [myTasks, setMyTasks] = useState<Map<string, MyTask>>(new Map());
   const [refreshedAt, setRefreshedAt] = useState(0); // last Reload click (epoch ms)
   const [showArchived, setShowArchived] = useState(false);
+  const [filter, setFilter] = useState("all");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   // Task keys (`${repo}::${task}`) marked "updating" — action buttons disabled.
   // Persisted in localStorage so it survives a page refresh.
@@ -655,6 +667,52 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     [copyValue]
   );
 
+  // Classify a task into one of the filter-board categories (matching its
+  // primary action state). "other" = add-environment/connect/validated/etc.
+  const categoryOf = useCallback(
+    (r: RepoRow, t: TaskItem): string => {
+      const key = `${r.name}::${t.name}`;
+      if (updating.has(key)) return "updating";
+      const conn = r.repoUrl ? connected.get(normUrl(r.repoUrl)) : undefined;
+      const myTask = conn?.id ? myTasks.get(`${conn.id}::${t.taskName}`) : undefined;
+      if (myTask) {
+        if (myTask.status === "Needs Review") return "needs-review";
+        if (isValidating(myTask)) return "validating";
+        if (
+          myTask.failedStage ||
+          /fail/i.test(myTask.status || "") ||
+          myTask.status === "Draft"
+        )
+          return "submit";
+        return "other";
+      }
+      const envState = envStateFor(conn, t.baseCommit);
+      if (envState === "building") return "building";
+      if (envState === "published") return "new-task";
+      return "other";
+    },
+    [updating, connected, myTasks]
+  );
+
+  const archiveVisible = useCallback(
+    (r: RepoRow, t: TaskItem) => (showArchived ? r.archived || t.archived : !t.archived),
+    [showArchived]
+  );
+
+  const filterCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const f of TASK_FILTERS) counts[f.key] = 0;
+    for (const r of repos) {
+      for (const t of tasks[r.name] || []) {
+        if (!archiveVisible(r, t)) continue;
+        counts.all++;
+        const c = categoryOf(r, t);
+        if (c in counts) counts[c]++;
+      }
+    }
+    return counts;
+  }, [repos, tasks, archiveVisible, categoryOf]);
+
   const q = search.trim().toLowerCase();
   const filtered = repos.filter((r) => {
     // Unchecked → unarchived repos. Checked → archived repos OR unarchived repos
@@ -664,6 +722,13 @@ export default function Gold({ manualToken }: { manualToken: string }) {
       : !r.archived;
     if (!matchesArchive) return false;
     if (q && !r.name.toLowerCase().includes(q)) return false;
+    // Filter board: keep only repos that have a matching (and archive-visible) task.
+    if (filter !== "all") {
+      const hasMatch = (tasks[r.name] || []).some(
+        (t) => archiveVisible(r, t) && categoryOf(r, t) === filter
+      );
+      if (!hasMatch) return false;
+    }
     return true;
   });
 
@@ -710,6 +775,24 @@ export default function Gold({ manualToken }: { manualToken: string }) {
             refreshed at {new Date(refreshedAt).toLocaleTimeString()}
           </span>
         )}
+      </section>
+
+      {/* Filter board */}
+      <section className="mb-4 flex flex-wrap items-center gap-1.5">
+        {TASK_FILTERS.map((f) => (
+          <button
+            key={f.key}
+            onClick={() => setFilter(f.key)}
+            className={`rounded-full border px-3 py-1 text-xs ${
+              filter === f.key
+                ? "border-amber-600 bg-amber-600/20 text-amber-200"
+                : "border-neutral-700 text-neutral-400 hover:bg-neutral-800"
+            }`}
+          >
+            {f.label}
+            <span className="ml-1.5 text-neutral-500">{filterCounts[f.key] ?? 0}</span>
+          </button>
+        ))}
       </section>
 
       {err && (
@@ -868,17 +951,27 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                             {tasksErr[r.name]}
                           </td>
                         </tr>
-                      ) : (tasks[r.name] || []).filter((t) =>
-                          showArchived ? r.archived || t.archived : !t.archived
+                      ) : (tasks[r.name] || []).filter(
+                          (t) =>
+                            archiveVisible(r, t) &&
+                            (filter === "all" || categoryOf(r, t) === filter)
                         ).length === 0 ? (
                         <tr className="border-b border-neutral-900 bg-neutral-950/40">
                           <td colSpan={8} className="px-3 py-2 pl-10 text-xs text-neutral-500">
-                            {showArchived ? "No archived tasks." : "No tasks."}
+                            {filter !== "all"
+                              ? "No tasks match this filter."
+                              : showArchived
+                              ? "No archived tasks."
+                              : "No tasks."}
                           </td>
                         </tr>
                       ) : (
                         (tasks[r.name] || [])
-                          .filter((t) => (showArchived ? r.archived || t.archived : !t.archived))
+                          .filter(
+                            (t) =>
+                              archiveVisible(r, t) &&
+                              (filter === "all" || categoryOf(r, t) === filter)
+                          )
                           .map((t) => {
                           const key = `${r.name}::${t.name}`;
                           const serverState = envStateFor(conn, t.baseCommit);
@@ -899,6 +992,9 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                               myTask.baseSha &&
                               myTask.baseSha.toLowerCase() !== t.baseCommit.toLowerCase()
                           );
+                          const errorMsgs = myTask
+                            ? myTask.messages.filter((m) => m.level === "error")
+                            : [];
                           return (
                             <tr
                               key={key}
@@ -1080,29 +1176,19 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                 </div>
                               </td>
                               <td className="px-3 py-1.5">
-                                {myTask && myTask.messages.length > 0 ? (
+                                {myTask && errorMsgs.length > 0 ? (
                                   <div className="group relative inline-block">
                                     <button
                                       onClick={() => copyMessages(key, t.name, myTask.messages)}
                                       title="Copy error messages"
-                                      className="inline-flex h-6 w-6 items-center justify-center rounded border border-neutral-700 text-amber-300 hover:bg-neutral-800"
+                                      className="inline-flex h-6 w-6 items-center justify-center rounded border border-neutral-700 text-red-300 hover:bg-neutral-800"
                                     >
                                       {copiedKey === key ? "✓" : "⚠"}
                                     </button>
                                     <div className="pointer-events-none absolute right-0 top-7 z-50 hidden max-h-[280px] w-[340px] overflow-auto rounded border border-neutral-700 bg-neutral-950 p-2 text-left shadow-xl group-hover:block">
-                                      {myTask.messages.map((m, i) => (
+                                      {errorMsgs.map((m, i) => (
                                         <div key={i} className="mb-1.5 last:mb-0 text-[10px] leading-snug">
-                                          <span
-                                            className={
-                                              m.level === "error"
-                                                ? "text-red-400"
-                                                : m.level === "warning"
-                                                ? "text-amber-400"
-                                                : "text-neutral-400"
-                                            }
-                                          >
-                                            [{m.scope}] {m.level}
-                                          </span>
+                                          <span className="text-red-400">[{m.scope}]</span>
                                           <span className="text-neutral-300"> — {m.message}</span>
                                           {m.path && (
                                             <span className="text-neutral-600"> ({m.path})</span>
