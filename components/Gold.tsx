@@ -617,6 +617,34 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     [loadRepos]
   );
 
+  // Refresh a single task's data from disk (used when unchecking "updating"),
+  // updating only that task's row — not the whole repo.
+  const refreshOneTask = useCallback(async (repoName: string, taskFolder: string) => {
+    try {
+      const res = await fetch(
+        `/api/gold/task?repo=${encodeURIComponent(repoName)}&task=${encodeURIComponent(taskFolder)}`,
+        { cache: "no-store" }
+      );
+      const data = await res.json();
+      if (!data.ok) return;
+      setTasks((prev) => {
+        const list = prev[repoName];
+        if (!list) return prev;
+        if (!data.task) {
+          // Task no longer exists on disk → drop it from the row list.
+          return { ...prev, [repoName]: list.filter((t) => t.name !== taskFolder) };
+        }
+        const exists = list.some((t) => t.name === taskFolder);
+        const next = exists
+          ? list.map((t) => (t.name === taskFolder ? (data.task as TaskItem) : t))
+          : [...list, data.task as TaskItem];
+        return { ...prev, [repoName]: next };
+      });
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   // Load persisted "updating" task keys once on mount.
   useEffect(() => {
     try {
@@ -641,15 +669,14 @@ export default function Gold({ manualToken }: { manualToken: string }) {
         }
         return next;
       });
-      // On uncheck → re-read this repo's task data from disk (e.g. a changed
-      // base_commit in task.toml.lines.txt), and refresh created-task state.
+      // On uncheck → re-read only THIS task's data from disk (e.g. a changed
+      // base_commit in task.toml.lines.txt); other tasks are left untouched.
       if (wasChecked) {
-        const repoName = key.split("::")[0];
-        loadTasks(repoName);
-        loadMyTasks();
+        const [repoName, taskFolder] = key.split("::");
+        refreshOneTask(repoName, taskFolder);
       }
     },
-    [updating, loadTasks, loadMyTasks]
+    [updating, refreshOneTask]
   );
 
   const copyValue = useCallback(async (key: string, text: string) => {

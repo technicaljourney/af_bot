@@ -8,10 +8,9 @@
 //
 // "Freshest" = the token whose JWT `exp` is latest.
 
-// The hosted Pluto app. The token is always forwarded here, regardless of the
-// popup's "App URL" field, so it works without changing anything in the popup.
-const SERVER_APP_BASE = "http://157.250.198.27:9090";
-const DEFAULT_APP_BASE = SERVER_APP_BASE;
+// Token targets come from the popup's "App URLs" field (one per line). No server
+// URL is hardcoded. This is only the fallback when nothing is configured yet.
+const DEFAULT_APP_BASE = "http://localhost:3137";
 
 let best = { token: null, exp: 0 };
 
@@ -28,12 +27,13 @@ function jwtExp(token) {
 }
 
 async function getAppBases() {
-  // App URLs saved in the popup (one per line → array). Falls back to a legacy
-  // single `appBase`, then to the hosted server, so it always has a target.
+  // App URLs saved in the popup (one per line → array) are the source of truth.
+  // Falls back to a legacy single `appBase`, then the default, so there's always
+  // at least one target — but no server URL is baked into the code.
   const { appBases, appBase } = await chrome.storage.local.get(["appBases", "appBase"]);
   if (Array.isArray(appBases) && appBases.length) return appBases;
   if (appBase) return [appBase];
-  return [SERVER_APP_BASE];
+  return [DEFAULT_APP_BASE];
 }
 
 // POST the token to EVERY configured app URL and record a per-URL result.
