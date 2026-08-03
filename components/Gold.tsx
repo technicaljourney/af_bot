@@ -207,12 +207,13 @@ const taskUrl = (id: string) => `https://experts.afterquery.com/projects/gold/ta
 /** Filter-board categories, mapped to a task's current action state. */
 const TASK_FILTERS: { key: string; label: string }[] = [
   { key: "all", label: "All" },
-  { key: "needs-review", label: "Needs review" },
   { key: "updating", label: "Updating" },
   { key: "validating", label: "Validating" },
   { key: "submit", label: "Submit for validation" },
   { key: "building", label: "Building" },
+  { key: "add-env", label: "Add environment" },
   { key: "new-task", label: "New task" },
+  { key: "needs-review", label: "Needs review" },
 ];
 
 export default function Gold({ manualToken }: { manualToken: string }) {
@@ -717,6 +718,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
       const envState = envStateFor(conn, t.baseCommit);
       if (envState === "building") return "building";
       if (envState === "published") return "new-task";
+      if (envState === "none" && conn) return "add-env"; // connected, no env yet
       return "other";
     },
     [updating, connected, myTasks]
