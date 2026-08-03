@@ -242,7 +242,8 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   const [myTasks, setMyTasks] = useState<Map<string, MyTask>>(new Map());
   const [refreshedAt, setRefreshedAt] = useState(0); // last Reload click (epoch ms)
   const [showArchived, setShowArchived] = useState(false);
-  const [filter, setFilter] = useState("all");
+  // Selected filter-board categories (multi-select). Empty = "All".
+  const [filters, setFilters] = useState<Set<string>>(new Set());
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   // Task keys (`${repo}::${task}`) marked "updating" — action buttons disabled.
   // Persisted in localStorage so it survives a page refresh.
@@ -713,6 +714,13 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     return counts;
   }, [repos, tasks, archiveVisible, categoryOf]);
 
+  // A task passes the filter board when nothing is selected (All) or its
+  // category is one of the selected categories (OR).
+  const matchesFilter = useCallback(
+    (r: RepoRow, t: TaskItem) => filters.size === 0 || filters.has(categoryOf(r, t)),
+    [filters, categoryOf]
+  );
+
   const q = search.trim().toLowerCase();
   const filtered = repos.filter((r) => {
     // Unchecked → unarchived repos. Checked → archived repos OR unarchived repos
@@ -723,9 +731,9 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     if (!matchesArchive) return false;
     if (q && !r.name.toLowerCase().includes(q)) return false;
     // Filter board: keep only repos that have a matching (and archive-visible) task.
-    if (filter !== "all") {
+    if (filters.size > 0) {
       const hasMatch = (tasks[r.name] || []).some(
-        (t) => archiveVisible(r, t) && categoryOf(r, t) === filter
+        (t) => archiveVisible(r, t) && matchesFilter(r, t)
       );
       if (!hasMatch) return false;
     }
@@ -777,22 +785,34 @@ export default function Gold({ manualToken }: { manualToken: string }) {
         )}
       </section>
 
-      {/* Filter board */}
+      {/* Filter board (multi-select; "All" = none selected) */}
       <section className="mb-4 flex flex-wrap items-center gap-1.5">
-        {TASK_FILTERS.map((f) => (
-          <button
-            key={f.key}
-            onClick={() => setFilter(f.key)}
-            className={`rounded-full border px-3 py-1 text-xs ${
-              filter === f.key
-                ? "border-amber-600 bg-amber-600/20 text-amber-200"
-                : "border-neutral-700 text-neutral-400 hover:bg-neutral-800"
-            }`}
-          >
-            {f.label}
-            <span className="ml-1.5 text-neutral-500">{filterCounts[f.key] ?? 0}</span>
-          </button>
-        ))}
+        {TASK_FILTERS.map((f) => {
+          const active = f.key === "all" ? filters.size === 0 : filters.has(f.key);
+          return (
+            <button
+              key={f.key}
+              onClick={() =>
+                f.key === "all"
+                  ? setFilters(new Set())
+                  : setFilters((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(f.key)) next.delete(f.key);
+                      else next.add(f.key);
+                      return next;
+                    })
+              }
+              className={`rounded-full border px-3 py-1 text-xs ${
+                active
+                  ? "border-amber-600 bg-amber-600/20 text-amber-200"
+                  : "border-neutral-700 text-neutral-400 hover:bg-neutral-800"
+              }`}
+            >
+              {f.label}
+              <span className="ml-1.5 text-neutral-500">{filterCounts[f.key] ?? 0}</span>
+            </button>
+          );
+        })}
       </section>
 
       {err && (
@@ -952,13 +972,11 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                           </td>
                         </tr>
                       ) : (tasks[r.name] || []).filter(
-                          (t) =>
-                            archiveVisible(r, t) &&
-                            (filter === "all" || categoryOf(r, t) === filter)
+                          (t) => archiveVisible(r, t) && matchesFilter(r, t)
                         ).length === 0 ? (
                         <tr className="border-b border-neutral-900 bg-neutral-950/40">
                           <td colSpan={8} className="px-3 py-2 pl-10 text-xs text-neutral-500">
-                            {filter !== "all"
+                            {filters.size > 0
                               ? "No tasks match this filter."
                               : showArchived
                               ? "No archived tasks."
@@ -967,11 +985,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                         </tr>
                       ) : (
                         (tasks[r.name] || [])
-                          .filter(
-                            (t) =>
-                              archiveVisible(r, t) &&
-                              (filter === "all" || categoryOf(r, t) === filter)
-                          )
+                          .filter((t) => archiveVisible(r, t) && matchesFilter(r, t))
                           .map((t) => {
                           const key = `${r.name}::${t.name}`;
                           const serverState = envStateFor(conn, t.baseCommit);
