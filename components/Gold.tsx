@@ -207,12 +207,12 @@ const taskUrl = (id: string) => `https://experts.afterquery.com/projects/gold/ta
 /** Filter-board categories, mapped to a task's current action state. */
 const TASK_FILTERS: { key: string; label: string }[] = [
   { key: "all", label: "All" },
-  { key: "updating", label: "Updating" },
-  { key: "validating", label: "Validating" },
-  { key: "submit", label: "Submit for validation" },
-  { key: "building", label: "Building" },
   { key: "add-env", label: "Add environment" },
+  { key: "building", label: "Building" },
   { key: "new-task", label: "New task" },
+  { key: "updating", label: "Updating" },
+  { key: "submit", label: "Submit for validation" },
+  { key: "validating", label: "Validating" },
   { key: "needs-review", label: "Needs review" },
 ];
 
@@ -898,6 +898,9 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                 const state: ConnectState = r.repoUrl
                   ? connectState[r.repoUrl] ?? "idle"
                   : "idle";
+                const needsReview = (tasks[r.name] || []).filter(
+                  (t) => categoryOf(r, t) === "needs-review"
+                ).length;
                 return (
                   <Fragment key={r.name}>
                     <tr
@@ -927,6 +930,22 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                               >
                                 ↗
                               </a>
+                            )}
+                            {needsReview > 0 && (
+                              <span
+                                className="ml-2 whitespace-nowrap"
+                                title={`${needsReview} task(s) need review`}
+                              >
+                                {needsReview > 5 ? (
+                                  <span className="text-xs font-medium text-emerald-500">5+</span>
+                                ) : (
+                                  Array.from({ length: needsReview }).map((_, i) => (
+                                    <span key={i} className="text-emerald-500">
+                                      ●
+                                    </span>
+                                  ))
+                                )}
+                              </span>
                             )}
                             {r.repository && (
                               <div className="pl-5 text-xs text-neutral-500">{r.repository}</div>
