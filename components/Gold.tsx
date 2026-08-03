@@ -706,18 +706,24 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     for (const r of repos) {
       for (const t of tasks[r.name] || []) {
         if (!archiveVisible(r, t)) continue;
-        counts.all++;
         const c = categoryOf(r, t);
+        // "All" excludes needs-review (it has its own filter).
+        if (c !== "needs-review") counts.all++;
         if (c in counts) counts[c]++;
       }
     }
     return counts;
   }, [repos, tasks, archiveVisible, categoryOf]);
 
-  // A task passes the filter board when nothing is selected (All) or its
-  // category is one of the selected categories (OR).
+  // A task passes the filter board when a category is selected and matches (OR),
+  // or when nothing is selected ("All") — in which case "needs-review" tasks are
+  // hidden and only appear under the explicit "Needs review" filter.
   const matchesFilter = useCallback(
-    (r: RepoRow, t: TaskItem) => filters.size === 0 || filters.has(categoryOf(r, t)),
+    (r: RepoRow, t: TaskItem) => {
+      const c = categoryOf(r, t);
+      if (filters.size === 0) return c !== "needs-review";
+      return filters.has(c);
+    },
     [filters, categoryOf]
   );
 
@@ -955,7 +961,21 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                         </div>
                       </td>
                       <td className="px-3 py-2" />
-                      <td className="px-3 py-2" />
+                      <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => {
+                            loadTasks(r.name);
+                            loadMyTasks();
+                          }}
+                          disabled={tasksLoading[r.name]}
+                          title="Refresh this repo's tasks from disk"
+                          className={`inline-flex h-6 w-6 items-center justify-center rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 disabled:opacity-50 ${
+                            tasksLoading[r.name] ? "animate-spin" : ""
+                          }`}
+                        >
+                          ↻
+                        </button>
+                      </td>
                     </tr>
 
                     {isOpen &&
