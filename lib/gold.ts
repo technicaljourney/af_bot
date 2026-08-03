@@ -300,6 +300,86 @@ export function pipelineSteps(pipeline: unknown): PipelineStep[] {
   });
 }
 
+export interface GoldMessage {
+  scope: string; // "Overall" or a step label
+  level: string; // "error" | "warning" | "info" | …
+  message: string;
+  code?: string;
+  path?: string;
+}
+
+/** Collect every error/warning message from a task's pipeline: the top-level
+ *  failure (total) plus each stage's findings / error / judge reasons. */
+export function collectPipelineMessages(pipeline: unknown): GoldMessage[] {
+  const p = (pipeline && typeof pipeline === "object" ? pipeline : {}) as Record<string, unknown>;
+  const out: GoldMessage[] = [];
+
+  const failureReason = typeof p.failureReason === "string" ? p.failureReason : "";
+  const failureKind = typeof p.failureKind === "string" ? p.failureKind : "";
+  if (failureReason) {
+    out.push({
+      scope: "Overall",
+      level: "error",
+      message: failureKind ? `${failureKind}: ${failureReason}` : failureReason,
+    });
+  }
+
+  for (const { key, label } of GOLD_STEP_DEFS) {
+    const st = p[key];
+    if (!st || typeof st !== "object") continue;
+    const s = st as Record<string, unknown>;
+
+    if (Array.isArray(s.findings)) {
+      for (const f of s.findings) {
+        if (f && typeof f === "object") {
+          const fo = f as Record<string, unknown>;
+          if (typeof fo.message === "string" && fo.message) {
+            out.push({
+              scope: label,
+              level: typeof fo.level === "string" ? fo.level : "info",
+              message: fo.message,
+              code: typeof fo.code === "string" ? fo.code : undefined,
+              path: typeof fo.path === "string" ? fo.path : undefined,
+            });
+          }
+        }
+      }
+    }
+    if (typeof s.error === "string" && s.error) {
+      out.push({ scope: label, level: "error", message: s.error });
+    }
+    // Quality-review style rubric: criteria[] with outcome/explanation/blocking.
+    if (Array.isArray(s.criteria)) {
+      for (const c of s.criteria) {
+        if (c && typeof c === "object") {
+          const co = c as Record<string, unknown>;
+          const outcome = typeof co.outcome === "string" ? co.outcome : "";
+          if (outcome && outcome !== "pass") {
+            const name =
+              typeof co.name === "string" ? co.name.replace(/_/g, " ") : "criterion";
+            const explanation = typeof co.explanation === "string" ? co.explanation : "";
+            out.push({
+              scope: label,
+              level: co.blocking ? "error" : "warning",
+              message: `${name} (${outcome})${explanation ? `: ${explanation}` : ""}`,
+            });
+          }
+        }
+      }
+    }
+    const judge = s.judge as Record<string, unknown> | undefined;
+    if (judge && Array.isArray(judge.reasons)) {
+      const verdict = typeof judge.verdict === "string" ? judge.verdict : "";
+      if (verdict && verdict !== "clean") {
+        for (const r of judge.reasons) {
+          if (typeof r === "string" && r) out.push({ scope: label, level: "warning", message: r });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 export interface MyTask {
   id?: string;
   taskName: string;
@@ -312,6 +392,7 @@ export interface MyTask {
   /** pipeline.completedAt is set → the run finished. */
   pipelineDone: boolean;
   failedStage: string | null;
+  messages: GoldMessage[];
 }
 
 /** List the current user's Gold tasks (gold.tasks.listMine). */
@@ -365,6 +446,7 @@ export async function listMyTasks(token: string): Promise<MyTask[]> {
         pipelineDone: Boolean(pipeline && pipeline.completedAt),
         failedStage:
           pipeline && typeof pipeline.failedStage === "string" ? pipeline.failedStage : null,
+        messages: collectPipelineMessages(pipeline),
       };
     })
     .filter((r) => r.taskName);

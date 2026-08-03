@@ -24,6 +24,7 @@ interface RepoRow {
   repository: string | null;
   cloneUrl: string | null;
   defaultBranch: string | null;
+  archived: boolean;
 }
 
 interface GoldEnvironment {
@@ -47,12 +48,21 @@ interface TaskItem {
   modifiedMs: number;
   baseCommit: string | null;
   taskName: string;
+  archived: boolean;
 }
 
 interface PipelineStep {
   key: string;
   label: string;
   status: string; // passed | running | failed | pending
+}
+
+interface GoldMessage {
+  scope: string;
+  level: string;
+  message: string;
+  code?: string;
+  path?: string;
 }
 
 interface MyTask {
@@ -65,6 +75,42 @@ interface MyTask {
   steps: PipelineStep[];
   pipelineDone: boolean;
   failedStage: string | null;
+  messages: GoldMessage[];
+}
+
+/** Copy text to clipboard, with a fallback for insecure (http) origins where
+ *  navigator.clipboard is unavailable. */
+async function copyText(text: string): Promise<void> {
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    /* fall through to legacy copy */
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    document.body.removeChild(ta);
+  }
+}
+
+/** Format ERROR messages for the clipboard (warnings excluded):
+ *   Task: <task-name>
+ *   Error:
+ *   <error message(s)>
+ */
+function errorsToText(taskName: string, msgs: GoldMessage[]): string {
+  const errors = msgs.filter((m) => m.level === "error").map((m) => m.message);
+  return `Task: ${taskName}\nError:\n${errors.join("\n")}`;
 }
 
 /** A task is mid-validation while its status is "Validating" and not finished. */
@@ -155,6 +201,9 @@ function normUrl(u: string | null): string {
   return (u || "").trim().toLowerCase().replace(/\.git$/, "").replace(/\/+$/, "");
 }
 
+/** AfterQuery task page URL for a created task id. */
+const taskUrl = (id: string) => `https://experts.afterquery.com/projects/gold/tasks/${id}`;
+
 export default function Gold({ manualToken }: { manualToken: string }) {
   const [dir, setDir] = useState("");
   const [repos, setRepos] = useState<RepoRow[]>([]);
@@ -180,6 +229,19 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   const [deleting, setDeleting] = useState<Set<string>>(new Set()); // task keys mid delete
   // Created tasks keyed by `${repoId}::${taskName}` (from gold.tasks.listMine).
   const [myTasks, setMyTasks] = useState<Map<string, MyTask>>(new Map());
+  const [refreshedAt, setRefreshedAt] = useState(0); // last Reload click (epoch ms)
+  const [showArchived, setShowArchived] = useState(false);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  // Task keys (`${repo}::${task}`) marked "updating" — action buttons disabled.
+  // Persisted in localStorage so it survives a page refresh.
+  const [updating, setUpdating] = useState<Set<string>>(new Set());
+  const [confirmState, setConfirmState] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  } | null>(null);
 
   const loadRepos = useCallback(async () => {
     setLoading(true);
@@ -265,6 +327,15 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   useEffect(() => {
     loadMyTasks();
   }, [loadMyTasks]);
+
+  // After the repo list (re)loads — on mount and on Reload — expand every repo
+  // and (re)fetch its task tree, so all repos appear expanded with fresh tasks.
+  useEffect(() => {
+    if (repos.length === 0) return;
+    const names = repos.map((r) => r.name);
+    setExpanded(new Set(names));
+    names.forEach((name) => loadTasks(name));
+  }, [repos, loadTasks]);
 
   const toggleExpand = useCallback(
     (repoName: string) => {
@@ -512,8 +583,89 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     [manualToken, loadMyTasks]
   );
 
+  const toggleArchive = useCallback(
+    async (scope: "repo" | "task", repoName: string, taskFolder: string | undefined, archived: boolean) => {
+      try {
+        const res = await fetch("/api/gold/archive", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scope, repo: repoName, task: taskFolder, archived }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "Archive failed");
+        // loadRepos → repos change → the auto-expand effect re-reads task trees,
+        // so archived flags refresh for both repo- and task-scope changes.
+        loadRepos();
+      } catch (e) {
+        const key = taskFolder ? `${repoName}::${taskFolder}` : repoName;
+        setEnvMsg((m) => ({ ...m, [key]: (e as Error).message }));
+      }
+    },
+    [loadRepos]
+  );
+
+  // Load persisted "updating" task keys once on mount.
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("pluto.gold.updating") || "[]");
+      if (Array.isArray(saved)) setUpdating(new Set(saved as string[]));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const toggleUpdating = useCallback(
+    (key: string) => {
+      const wasChecked = updating.has(key);
+      setUpdating((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        try {
+          localStorage.setItem("pluto.gold.updating", JSON.stringify([...next]));
+        } catch {
+          /* ignore quota */
+        }
+        return next;
+      });
+      // On uncheck → re-read this repo's task data from disk (e.g. a changed
+      // base_commit in task.toml.lines.txt), and refresh created-task state.
+      if (wasChecked) {
+        const repoName = key.split("::")[0];
+        loadTasks(repoName);
+        loadMyTasks();
+      }
+    },
+    [updating, loadTasks, loadMyTasks]
+  );
+
+  const copyValue = useCallback(async (key: string, text: string) => {
+    try {
+      await copyText(text);
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1500);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const copyMessages = useCallback(
+    (key: string, taskName: string, msgs: GoldMessage[]) =>
+      copyValue(key, errorsToText(taskName, msgs)),
+    [copyValue]
+  );
+
   const q = search.trim().toLowerCase();
-  const filtered = q ? repos.filter((r) => r.name.toLowerCase().includes(q)) : repos;
+  const filtered = repos.filter((r) => {
+    // Unchecked → unarchived repos. Checked → archived repos OR unarchived repos
+    // that contain at least one archived task (so per-task archives are visible).
+    const matchesArchive = showArchived
+      ? r.archived || (tasks[r.name] || []).some((t) => t.archived)
+      : !r.archived;
+    if (!matchesArchive) return false;
+    if (q && !r.name.toLowerCase().includes(q)) return false;
+    return true;
+  });
 
   return (
     <div>
@@ -538,11 +690,26 @@ export default function Gold({ manualToken }: { manualToken: string }) {
             loadRepos();
             loadConnected();
             loadMyTasks();
+            setRefreshedAt(Date.now());
           }}
           className="rounded border border-neutral-700 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-800"
         >
           Reload
         </button>
+        <label className="flex items-center gap-1.5 text-xs text-neutral-400">
+          <input
+            type="checkbox"
+            checked={showArchived}
+            onChange={(e) => setShowArchived(e.target.checked)}
+            className="h-3.5 w-3.5 accent-amber-600"
+          />
+          Show archived
+        </label>
+        {refreshedAt > 0 && (
+          <span className="text-xs text-neutral-500">
+            refreshed at {new Date(refreshedAt).toLocaleTimeString()}
+          </span>
+        )}
       </section>
 
       {err && (
@@ -565,19 +732,22 @@ export default function Gold({ manualToken }: { manualToken: string }) {
               <th className="px-3 py-2">Tasks</th>
               <th className="px-3 py-2">STATUS.md</th>
               <th className="px-3 py-2">Modified</th>
+              <th className="px-3 py-2">Updating</th>
               <th className="px-3 py-2">Action</th>
+              <th className="px-3 py-2">Msgs</th>
+              <th className="px-3 py-2">Go</th>
             </tr>
           </thead>
           <tbody>
             {loading ? (
               <tr>
-                <td colSpan={5} className="px-3 py-6 text-center text-neutral-500">
+                <td colSpan={8} className="px-3 py-6 text-center text-neutral-500">
                   Loading…
                 </td>
               </tr>
             ) : filtered.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-3 py-6 text-center text-neutral-500">
+                <td colSpan={8} className="px-3 py-6 text-center text-neutral-500">
                   {repos.length === 0 ? "No repos in result/." : "No repos match."}
                 </td>
               </tr>
@@ -596,7 +766,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                       onClick={() => canExpand && toggleExpand(r.name)}
                       className={`border-b border-neutral-900 align-top hover:bg-neutral-900/50 ${
                         canExpand ? "cursor-pointer" : ""
-                      }`}
+                      } ${r.archived ? "opacity-50" : ""}`}
                     >
                       <td className="px-3 py-2">
                         <div className="flex items-start gap-1.5">
@@ -608,6 +778,18 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                           </span>
                           <div>
                             <span className="font-medium text-neutral-200">📁 {r.name}</span>
+                            {r.repoUrl && (
+                              <a
+                                href={r.repoUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                title={`Open GitHub repo: ${r.repoUrl}`}
+                                className="ml-2 text-neutral-500 hover:text-neutral-200"
+                              >
+                                ↗
+                              </a>
+                            )}
                             {r.repository && (
                               <div className="pl-5 text-xs text-neutral-500">{r.repository}</div>
                             )}
@@ -623,52 +805,81 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                         )}
                       </td>
                       <td className="px-3 py-2 text-xs text-neutral-400">{fmtDate(r.modifiedMs)}</td>
+                      <td className="px-3 py-2" />
                       <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
-                        {!r.repoUrl ? (
-                          <span className="text-xs text-neutral-600">no repo_url</span>
-                        ) : isConnected ? (
-                          <span className="text-xs text-emerald-400">✓ connected</span>
-                        ) : (
-                          <div className="flex flex-col gap-1">
-                            <button
-                              onClick={() => connect(r.repoUrl!)}
-                              disabled={state === "connecting"}
-                              title={r.repoUrl}
-                              className="rounded bg-amber-600 px-3 py-1 text-xs font-medium text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                              {state === "connecting" ? "Connecting…" : "Connect repo"}
-                            </button>
-                            {state === "error" && connectMsg[r.repoUrl] && (
-                              <span className="max-w-[220px] break-words text-[10px] text-red-400">
-                                {connectMsg[r.repoUrl]}
-                              </span>
-                            )}
-                          </div>
-                        )}
+                        <div className="flex flex-col items-start gap-1">
+                          {!r.repoUrl ? (
+                            <span className="text-xs text-neutral-600">no repo_url</span>
+                          ) : isConnected ? (
+                            <span className="text-xs text-emerald-400">✓ connected</span>
+                          ) : (
+                            <div className="flex flex-col gap-1">
+                              <button
+                                onClick={() => connect(r.repoUrl!)}
+                                disabled={state === "connecting"}
+                                title={r.repoUrl}
+                                className="rounded bg-amber-600 px-3 py-1 text-xs font-medium text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {state === "connecting" ? "Connecting…" : "Connect repo"}
+                              </button>
+                              {state === "error" && connectMsg[r.repoUrl] && (
+                                <span className="max-w-[220px] break-words text-[10px] text-red-400">
+                                  {connectMsg[r.repoUrl]}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                          <button
+                            onClick={() =>
+                              r.archived
+                                ? toggleArchive("repo", r.name, undefined, false)
+                                : setConfirmState({
+                                    title: "Archive repo",
+                                    message: `Archive "${r.name}" and all its tasks? It will be hidden from the list. You can unarchive it later via "Show archived".`,
+                                    confirmLabel: "Archive",
+                                    onConfirm: () => toggleArchive("repo", r.name, undefined, true),
+                                  })
+                            }
+                            title={
+                              r.archived
+                                ? "Restore this repo"
+                                : "Archive this repo and all its tasks"
+                            }
+                            className="text-[10px] text-neutral-500 hover:text-neutral-200"
+                          >
+                            {r.archived ? "↩ Unarchive repo" : "🗄 Archive repo"}
+                          </button>
+                        </div>
                       </td>
+                      <td className="px-3 py-2" />
+                      <td className="px-3 py-2" />
                     </tr>
 
                     {isOpen &&
                       (tasksLoading[r.name] ? (
                         <tr className="border-b border-neutral-900 bg-neutral-950/40">
-                          <td colSpan={5} className="px-3 py-2 pl-10 text-xs text-neutral-500">
+                          <td colSpan={8} className="px-3 py-2 pl-10 text-xs text-neutral-500">
                             Loading tasks…
                           </td>
                         </tr>
                       ) : tasksErr[r.name] ? (
                         <tr className="border-b border-neutral-900 bg-neutral-950/40">
-                          <td colSpan={5} className="px-3 py-2 pl-10 text-xs text-red-400">
+                          <td colSpan={8} className="px-3 py-2 pl-10 text-xs text-red-400">
                             {tasksErr[r.name]}
                           </td>
                         </tr>
-                      ) : !tasks[r.name] || tasks[r.name].length === 0 ? (
+                      ) : (tasks[r.name] || []).filter((t) =>
+                          showArchived ? r.archived || t.archived : !t.archived
+                        ).length === 0 ? (
                         <tr className="border-b border-neutral-900 bg-neutral-950/40">
-                          <td colSpan={5} className="px-3 py-2 pl-10 text-xs text-neutral-500">
-                            No tasks.
+                          <td colSpan={8} className="px-3 py-2 pl-10 text-xs text-neutral-500">
+                            {showArchived ? "No archived tasks." : "No tasks."}
                           </td>
                         </tr>
                       ) : (
-                        tasks[r.name].map((t) => {
+                        (tasks[r.name] || [])
+                          .filter((t) => (showArchived ? r.archived || t.archived : !t.archived))
+                          .map((t) => {
                           const key = `${r.name}::${t.name}`;
                           const serverState = envStateFor(conn, t.baseCommit);
                           // Treat a just-submitted task as building until the
@@ -691,11 +902,20 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                           return (
                             <tr
                               key={key}
-                              className="border-b border-neutral-900 bg-neutral-950/40 hover:bg-neutral-900/40"
+                              className={`border-b border-neutral-900 bg-neutral-950/40 hover:bg-neutral-900/40 ${
+                                t.archived ? "opacity-50" : ""
+                              }`}
                             >
                               <td className="px-3 py-1.5">
                                 <span className="whitespace-nowrap pl-6 text-neutral-300">
                                   <span className="text-neutral-600">└ </span>📄 {t.name}
+                                  <button
+                                    onClick={() => copyValue(`${key}:name`, t.name)}
+                                    title="Copy task name"
+                                    className="ml-1.5 text-neutral-500 hover:text-neutral-200"
+                                  >
+                                    {copiedKey === `${key}:name` ? "✓" : "⧉"}
+                                  </button>
                                   {t.baseCommit && (
                                     <span className="ml-2 text-[10px] text-neutral-600">
                                       @{t.baseCommit.slice(0, 7)}
@@ -711,6 +931,20 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                 {fmtDate(t.modifiedMs)}
                               </td>
                               <td className="px-3 py-1.5">
+                                <input
+                                  type="checkbox"
+                                  checked={updating.has(key)}
+                                  onChange={() => toggleUpdating(key)}
+                                  title="Mark this task as updating (disables its action buttons)"
+                                  className="h-4 w-4 accent-amber-600"
+                                />
+                              </td>
+                              <td className="px-3 py-1.5">
+                                <div
+                                  className={`flex flex-col items-start gap-1.5 ${
+                                    updating.has(key) ? "pointer-events-none opacity-40" : ""
+                                  }`}
+                                >
                                 {!isConnected ? (
                                   <span className="text-[10px] text-neutral-600">
                                     connect repo first
@@ -730,7 +964,15 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                             </button>
                                           ) : (
                                             <button
-                                              onClick={() => deleteTask(r.name, t, myTask)}
+                                              onClick={() =>
+                                                setConfirmState({
+                                                  title: "Delete task",
+                                                  message: `Delete task "${t.name}"? This archives the created task on AfterQuery so you can rebuild it for the new base_commit.`,
+                                                  confirmLabel: "Delete",
+                                                  danger: true,
+                                                  onConfirm: () => deleteTask(r.name, t, myTask),
+                                                })
+                                              }
                                               className="rounded bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-500"
                                             >
                                               Delete
@@ -819,6 +1061,74 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                     )}
                                   </div>
                                 )}
+                                <button
+                                  onClick={() =>
+                                    t.archived
+                                      ? toggleArchive("task", r.name, t.name, false)
+                                      : setConfirmState({
+                                          title: "Archive task",
+                                          message: `Archive task "${t.name}"? It will be hidden from the list. You can unarchive it later via "Show archived".`,
+                                          confirmLabel: "Archive",
+                                          onConfirm: () => toggleArchive("task", r.name, t.name, true),
+                                        })
+                                  }
+                                  title={t.archived ? "Restore this task" : "Archive this task"}
+                                  className="text-[10px] text-neutral-500 hover:text-neutral-200"
+                                >
+                                  {t.archived ? "↩ Unarchive" : "🗄 Archive"}
+                                </button>
+                                </div>
+                              </td>
+                              <td className="px-3 py-1.5">
+                                {myTask && myTask.messages.length > 0 ? (
+                                  <div className="group relative inline-block">
+                                    <button
+                                      onClick={() => copyMessages(key, t.name, myTask.messages)}
+                                      title="Copy error messages"
+                                      className="inline-flex h-6 w-6 items-center justify-center rounded border border-neutral-700 text-amber-300 hover:bg-neutral-800"
+                                    >
+                                      {copiedKey === key ? "✓" : "⚠"}
+                                    </button>
+                                    <div className="pointer-events-none absolute right-0 top-7 z-50 hidden max-h-[280px] w-[340px] overflow-auto rounded border border-neutral-700 bg-neutral-950 p-2 text-left shadow-xl group-hover:block">
+                                      {myTask.messages.map((m, i) => (
+                                        <div key={i} className="mb-1.5 last:mb-0 text-[10px] leading-snug">
+                                          <span
+                                            className={
+                                              m.level === "error"
+                                                ? "text-red-400"
+                                                : m.level === "warning"
+                                                ? "text-amber-400"
+                                                : "text-neutral-400"
+                                            }
+                                          >
+                                            [{m.scope}] {m.level}
+                                          </span>
+                                          <span className="text-neutral-300"> — {m.message}</span>
+                                          {m.path && (
+                                            <span className="text-neutral-600"> ({m.path})</span>
+                                          )}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <span className="text-neutral-700">—</span>
+                                )}
+                              </td>
+                              <td className="px-3 py-1.5">
+                                {myTask?.id ? (
+                                  <a
+                                    href={taskUrl(myTask.id)}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    title="Open this task on AfterQuery"
+                                    className="inline-flex h-6 w-6 items-center justify-center rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 hover:text-white"
+                                  >
+                                    ↗
+                                  </a>
+                                ) : (
+                                  <span className="text-neutral-700">—</span>
+                                )}
                               </td>
                             </tr>
                           );
@@ -836,6 +1146,43 @@ export default function Gold({ manualToken }: { manualToken: string }) {
         {filtered.length} of {repos.length} repo{repos.length === 1 ? "" : "s"} ·{" "}
         auth: {manualToken.trim() ? "manual token present" : "using extension / refresh token"}
       </p>
+
+      {confirmState && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setConfirmState(null)}
+        >
+          <div
+            className="w-full max-w-sm rounded-lg border border-neutral-700 bg-neutral-900 p-5 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-sm font-semibold text-neutral-100">{confirmState.title}</h3>
+            <p className="mt-2 text-xs leading-relaxed text-neutral-400">{confirmState.message}</p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                onClick={() => setConfirmState(null)}
+                className="rounded border border-neutral-700 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  const fn = confirmState.onConfirm;
+                  setConfirmState(null);
+                  fn();
+                }}
+                className={`rounded px-3 py-1.5 text-xs font-medium text-white ${
+                  confirmState.danger
+                    ? "bg-red-600 hover:bg-red-500"
+                    : "bg-amber-600 hover:bg-amber-500"
+                }`}
+              >
+                {confirmState.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

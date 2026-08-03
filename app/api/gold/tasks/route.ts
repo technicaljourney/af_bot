@@ -13,6 +13,8 @@ interface TaskItem {
   /** task_name from task.toml.lines.txt (may differ from the folder name);
    *  used to match against gold.tasks.listMine. Falls back to the folder name. */
   taskName: string;
+  /** `<task>/.archived` marker exists → locally archived (hidden by default). */
+  archived: boolean;
 }
 
 /** Read base_commit + task_name from a task's toml/config. */
@@ -74,12 +76,20 @@ export async function GET(req: NextRequest) {
       } catch {
         /* ignore */
       }
+      let archived = false;
+      try {
+        await fs.access(path.join(taskPath, ".archived"));
+        archived = true;
+      } catch {
+        /* not archived */
+      }
       const meta = await readTaskMeta(taskPath, d.name);
       tasks.push({
         name: d.name,
         modifiedMs,
         baseCommit: meta.baseCommit,
         taskName: meta.taskName,
+        archived,
       });
     }
     tasks.sort((a, b) => a.name.localeCompare(b.name));

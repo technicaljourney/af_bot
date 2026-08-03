@@ -22,6 +22,8 @@ interface RepoRow {
   cloneUrl: string | null;
   /** default_branch from data.txt, if present. */
   defaultBranch: string | null;
+  /** `<repo>/.archived` marker exists → locally archived (hidden by default). */
+  archived: boolean;
 }
 
 /** Read + parse `<repo>/data.txt` (TOML). Returns {} if missing/unparseable. */
@@ -86,6 +88,13 @@ export async function GET() {
       } catch {
         /* no tasks/ */
       }
+      let archived = false;
+      try {
+        await fs.access(path.join(repoPath, ".archived"));
+        archived = true;
+      } catch {
+        /* not archived */
+      }
       const data = await readData(repoPath);
       repos.push({
         name: d.name,
@@ -96,6 +105,7 @@ export async function GET() {
         repository: str(data.repository),
         cloneUrl: str(data.clone_url),
         defaultBranch: str(data.default_branch),
+        archived,
       });
     }
     repos.sort((a, b) => a.name.localeCompare(b.name));
