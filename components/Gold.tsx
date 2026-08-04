@@ -221,6 +221,7 @@ const TASK_FILTERS: { key: string; label: string }[] = [
   { key: "submit", label: "Submit for validation" },
   { key: "validating", label: "Validating" },
   { key: "needs-review", label: "Needs review" },
+  { key: "approved", label: "Approved" },
 ];
 
 export default function Gold({ manualToken }: { manualToken: string }) {
@@ -713,6 +714,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
       const myTask = conn?.id ? myTasks.get(`${conn.id}::${t.taskName}`) : undefined;
       if (myTask) {
         if (myTask.status === "Needs Review") return "needs-review";
+        if ((myTask.status || "").toLowerCase() === "approved") return "approved";
         if (isValidating(myTask)) return "validating";
         if (
           myTask.failedStage ||
@@ -743,8 +745,8 @@ export default function Gold({ manualToken }: { manualToken: string }) {
       for (const t of tasks[r.name] || []) {
         if (!archiveVisible(r, t)) continue;
         const c = categoryOf(r, t);
-        // "All" excludes needs-review (it has its own filter).
-        if (c !== "needs-review") counts.all++;
+        // "All" excludes needs-review and approved (they have their own filters).
+        if (c !== "needs-review" && c !== "approved") counts.all++;
         if (c in counts) counts[c]++;
       }
     }
@@ -757,7 +759,8 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   const matchesFilter = useCallback(
     (r: RepoRow, t: TaskItem) => {
       const c = categoryOf(r, t);
-      if (filters.size === 0) return c !== "needs-review";
+      // "All" hides needs-review and approved (each has its own filter).
+      if (filters.size === 0) return c !== "needs-review" && c !== "approved";
       return filters.has(c);
     },
     [filters, categoryOf]
@@ -944,9 +947,10 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                 const state: ConnectState = r.repoUrl
                   ? connectState[r.repoUrl] ?? "idle"
                   : "idle";
-                const needsReview = (tasks[r.name] || []).filter(
-                  (t) => categoryOf(r, t) === "needs-review"
-                ).length;
+                const needsReview = (tasks[r.name] || []).filter((t) => {
+                  const c = categoryOf(r, t);
+                  return c === "needs-review" || c === "approved";
+                }).length;
                 return (
                   <Fragment key={r.name}>
                     <tr
@@ -980,7 +984,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                             {needsReview > 0 && (
                               <span
                                 className="ml-2 whitespace-nowrap"
-                                title={`${needsReview} task(s) need review`}
+                                title={`${needsReview} task(s) need review or approved`}
                               >
                                 {needsReview > 5 ? (
                                   <span className="text-xs font-medium text-emerald-500">5+</span>
