@@ -103,13 +103,20 @@ async function copyText(text: string): Promise<void> {
   }
 }
 
+/** Boilerplate stripped from copied error text (e.g. the AI-check "rewrite it
+ *  yourself" instruction, which isn't useful to paste). */
+const COPY_STRIP =
+  /\s*Instructions must be written by you\s*[—–-]\s*rewrite it in your own words and resubmit\.?/gi;
+
 /** Format ERROR messages for the clipboard (warnings excluded):
  *   Task: <task-name>
  *   Error:
  *   <error message(s)>
  */
 function errorsToText(taskName: string, msgs: GoldMessage[]): string {
-  const errors = msgs.filter((m) => m.level === "error").map((m) => m.message);
+  const errors = msgs
+    .filter((m) => m.level === "error")
+    .map((m) => m.message.replace(COPY_STRIP, "").trim());
   return `Task: ${taskName}\nError:\n${errors.join("\n")}`;
 }
 
