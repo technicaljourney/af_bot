@@ -756,6 +756,45 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     [filters, categoryOf]
   );
 
+  // Archived-view delete: archive the created task on AfterQuery (if any), then
+  // remove the task folder from disk.
+  const deleteArchivedTask = useCallback(
+    async (repoName: string, task: TaskItem, myTask: MyTask | undefined) => {
+      const key = `${repoName}::${task.name}`;
+      setDeleting((s) => new Set(s).add(key));
+      setEnvMsg((m) => ({ ...m, [key]: "" }));
+      try {
+        if (myTask?.id) {
+          const r1 = await fetch("/api/gold/delete-task", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ submissionId: myTask.id, token: manualToken }),
+          });
+          const d1 = await r1.json();
+          if (!d1.ok) throw new Error(d1.error || "Archive failed");
+        }
+        const r2 = await fetch("/api/gold/delete-task-dir", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ repo: repoName, task: task.name }),
+        });
+        const d2 = await r2.json();
+        if (!d2.ok) throw new Error(d2.error || "Failed to remove task folder");
+        loadRepos(); // folder gone → taskCount + task list refresh
+        loadMyTasks();
+      } catch (e) {
+        setEnvMsg((m) => ({ ...m, [key]: (e as Error).message }));
+      } finally {
+        setDeleting((s) => {
+          const next = new Set(s);
+          next.delete(key);
+          return next;
+        });
+      }
+    },
+    [manualToken, loadRepos, loadMyTasks]
+  );
+
   const q = search.trim().toLowerCase();
   const filtered = repos.filter((r) => {
     // Unchecked → unarchived repos. Checked → archived repos OR unarchived repos
@@ -986,26 +1025,28 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                               )}
                             </div>
                           )}
-                          <button
-                            onClick={() =>
-                              r.archived
-                                ? toggleArchive("repo", r.name, undefined, false)
-                                : setConfirmState({
-                                    title: "Archive repo",
-                                    message: `Archive "${r.name}" and all its tasks? It will be hidden from the list. You can unarchive it later via "Show archived".`,
-                                    confirmLabel: "Archive",
-                                    onConfirm: () => toggleArchive("repo", r.name, undefined, true),
-                                  })
-                            }
-                            title={
-                              r.archived
-                                ? "Restore this repo"
-                                : "Archive this repo and all its tasks"
-                            }
-                            className="text-[10px] text-neutral-500 hover:text-neutral-200"
-                          >
-                            {r.archived ? "↩ Unarchive repo" : "🗄 Archive repo"}
-                          </button>
+                          {(!showArchived || r.archived) && (
+                            <button
+                              onClick={() =>
+                                r.archived
+                                  ? toggleArchive("repo", r.name, undefined, false)
+                                  : setConfirmState({
+                                      title: "Archive repo",
+                                      message: `Archive "${r.name}" and all its tasks? It will be hidden from the list. You can unarchive it later via "Show archived".`,
+                                      confirmLabel: "Archive",
+                                      onConfirm: () => toggleArchive("repo", r.name, undefined, true),
+                                    })
+                              }
+                              title={
+                                r.archived
+                                  ? "Restore this repo"
+                                  : "Archive this repo and all its tasks"
+                              }
+                              className="text-[10px] text-neutral-500 hover:text-neutral-200"
+                            >
+                              {r.archived ? "↩ Unarchive repo" : "🗄 Archive repo"}
+                            </button>
+                          )}
                         </div>
                       </td>
                       <td className="px-3 py-2" />
@@ -1176,16 +1217,22 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                           Validating…
                                         </button>
                                       ) : myTask.failedStage || /fail/i.test(myTask.status || "") ? (
-                                        <button
-                                          onClick={() => submitForValidation(r.name, conn, t, myTask)}
-                                          title="Validation failed — save files + submit again"
-                                          className="rounded bg-violet-600 px-3 py-1 text-xs font-medium text-white hover:bg-violet-500"
-                                        >
-                                          Submit for validation
-                                        </button>
+                                        showArchived ? null : (
+                                          <button
+                                            onClick={() => submitForValidation(r.name, conn, t, myTask)}
+                                            title="Validation failed — save files + submit again"
+                                            className="rounded bg-violet-600 px-3 py-1 text-xs font-medium text-white hover:bg-violet-500"
+                                          >
+                                            Submit for validation
+                                          </button>
+                                        )
                                       ) : myTask.status && myTask.status !== "Draft" ? (
                                         <span className="text-xs font-medium text-emerald-400">
                                           {myTask.status}
+                                        </span>
+                                      ) : showArchived ? (
+                                        <span className="text-xs text-neutral-500">
+                                          {myTask.status || "Draft"}
                                         </span>
                                       ) : (
                                         <button
@@ -1239,6 +1286,28 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                     )}
                                   </div>
                                 )}
+                                {showArchived &&
+                                  (deleting.has(key) ? (
+                                    <span className="inline-flex items-center gap-1.5 text-[10px] text-neutral-400">
+                                      <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-neutral-600 border-t-red-400" />
+                                      Deleting…
+                                    </span>
+                                  ) : (
+                                    <button
+                                      onClick={() =>
+                                        setConfirmState({
+                                          title: "Delete task permanently",
+                                          message: `Permanently delete "${t.name}"? This archives the task on AfterQuery (if it was created) and removes its folder from disk. This cannot be undone.`,
+                                          confirmLabel: "Delete",
+                                          danger: true,
+                                          onConfirm: () => deleteArchivedTask(r.name, t, myTask),
+                                        })
+                                      }
+                                      className="rounded bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-500"
+                                    >
+                                      🗑 Delete
+                                    </button>
+                                  ))}
                                 <button
                                   onClick={() =>
                                     t.archived
