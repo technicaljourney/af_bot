@@ -165,7 +165,9 @@ function PipelineProgress({ steps }: { steps: PipelineStep[] }) {
 }
 
 type ConnectState = "idle" | "connecting" | "error";
-type EnvState = "none" | "building" | "published";
+type EnvState = "none" | "building" | "published" | "failed";
+
+const ENV_FAIL_STATUSES = new Set(["build_failed", "failed", "error", "rejected"]);
 
 /** Environment state for a task's base_commit within a connected repo. */
 function envStateFor(conn: ConnectedRepo | undefined, baseCommit: string | null): EnvState {
@@ -173,7 +175,10 @@ function envStateFor(conn: ConnectedRepo | undefined, baseCommit: string | null)
   const bc = baseCommit.toLowerCase();
   const matches = conn.environments.filter((e) => e.baseSha.toLowerCase() === bc);
   if (matches.some((e) => e.status === "published")) return "published";
-  if (matches.length > 0) return "building"; // exists but not yet published
+  // Any non-failure, non-published env → still building/pending.
+  if (matches.some((e) => !ENV_FAIL_STATUSES.has((e.status || "").toLowerCase())))
+    return "building";
+  if (matches.length > 0) return "failed"; // all matching env builds failed
   return "none";
 }
 
@@ -727,7 +732,8 @@ export default function Gold({ manualToken }: { manualToken: string }) {
       const envState = envStateFor(conn, t.baseCommit);
       if (envState === "building") return "building";
       if (envState === "published") return "new-task";
-      if (envState === "none" && conn) return "add-env"; // connected, no env yet
+      // no env yet OR a failed build → needs (re)build.
+      if ((envState === "none" || envState === "failed") && conn) return "add-env";
       return "other";
     },
     [updating, connected, myTasks]
@@ -1281,14 +1287,21 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                         Building…
                                       </button>
                                     ) : (
-                                      <button
-                                        onClick={() => addEnvironment(r.name, conn?.id, t)}
-                                        disabled={!t.baseCommit}
-                                        title={t.baseCommit ? "Build environment for this base_commit" : "No base_commit found"}
-                                        className="rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
-                                      >
-                                        Add environment
-                                      </button>
+                                      <>
+                                        <button
+                                          onClick={() => addEnvironment(r.name, conn?.id, t)}
+                                          disabled={!t.baseCommit}
+                                          title={t.baseCommit ? "Build environment for this base_commit" : "No base_commit found"}
+                                          className="rounded bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
+                                        >
+                                          Add environment
+                                        </button>
+                                        {envState === "failed" && (
+                                          <span className="text-[10px] text-red-400">
+                                            ✗ Environment build failed — retry.
+                                          </span>
+                                        )}
+                                      </>
                                     )}
                                     {envMsg[key] && (
                                       <span className="max-w-[240px] break-words text-[10px] text-neutral-400">
