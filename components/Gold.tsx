@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * Gold project tab.
@@ -49,6 +49,7 @@ interface TaskItem {
   baseCommit: string | null;
   taskName: string;
   archived: boolean;
+  status: string; // idle | updating | check | ready (from data.txt)
 }
 
 interface PipelineStep {
@@ -117,7 +118,7 @@ function errorsToText(taskName: string, msgs: GoldMessage[]): string {
   const errors = msgs
     .filter((m) => m.level === "error")
     .map((m) => m.message.replace(COPY_STRIP, "").trim());
-  return `Task: ${taskName}\nError:\n${errors.join("\n")}`;
+  return `/fix Task: ${taskName}\nError:\n${errors.join("\n")}`;
 }
 
 /** A task is mid-validation while its status is "Validating" and not finished. */
@@ -259,9 +260,10 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   // Selected filter-board categories (multi-select). Empty = "All".
   const [filters, setFilters] = useState<Set<string>>(new Set());
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  // Task keys (`${repo}::${task}`) marked "updating" — action buttons disabled.
-  // Persisted in localStorage so it survives a page refresh.
-  const [updating, setUpdating] = useState<Set<string>>(new Set());
+  // Real-time task statuses from result/<repo>/tasks/<task>/data.txt, keyed by
+  // `${repo}::${task}` (idle | updating | check | ready). Polled live.
+  const [statuses, setStatuses] = useState<Record<string, string>>({});
+  const statusesRef = useRef<Record<string, string>>({});
   const [confirmState, setConfirmState] = useState<{
     title: string;
     message: string;
@@ -269,6 +271,36 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     danger?: boolean;
     onConfirm: () => void;
   } | null>(null);
+
+  // Write a task's status to data.txt (optimistic local update first).
+  const setTaskStatus = useCallback(
+    async (repoName: string, taskFolder: string, status: string) => {
+      const key = `${repoName}::${taskFolder}`;
+      statusesRef.current = { ...statusesRef.current, [key]: status };
+      setStatuses((s) => ({ ...s, [key]: status }));
+      try {
+        await fetch("/api/gold/set-task-status", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ repo: repoName, task: taskFolder, status }),
+        });
+      } catch {
+        /* ignore */
+      }
+    },
+    []
+  );
+
+  // When an action button is clicked on a "ready" task, reset its status to idle.
+  const resetIfReady = useCallback(
+    (repoName: string, taskFolder: string) => {
+      const key = `${repoName}::${taskFolder}`;
+      if ((statusesRef.current[key] ?? "idle") === "ready") {
+        setTaskStatus(repoName, taskFolder, "idle");
+      }
+    },
+    [setTaskStatus]
+  );
 
   const loadRepos = useCallback(async () => {
     setLoading(true);
@@ -405,6 +437,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   const addEnvironment = useCallback(
     async (repoName: string, repoId: string | undefined, task: TaskItem) => {
       const key = `${repoName}::${task.name}`;
+      resetIfReady(repoName, task.name);
       if (!repoId) {
         setEnvMsg((m) => ({ ...m, [key]: "Missing repoId (repo not connected?)." }));
         return;
@@ -430,12 +463,13 @@ export default function Gold({ manualToken }: { manualToken: string }) {
         setEnvMsg((m) => ({ ...m, [key]: (e as Error).message }));
       }
     },
-    [manualToken, loadConnected]
+    [manualToken, loadConnected, resetIfReady]
   );
 
   const newTask = useCallback(
     async (repoName: string, conn: ConnectedRepo | undefined, task: TaskItem) => {
       const key = `${repoName}::${task.name}`;
+      resetIfReady(repoName, task.name);
       if (!conn?.id) {
         setEnvMsg((m) => ({ ...m, [key]: "Missing repoId (repo not connected?)." }));
         return;
@@ -473,12 +507,13 @@ export default function Gold({ manualToken }: { manualToken: string }) {
         });
       }
     },
-    [manualToken, loadMyTasks]
+    [manualToken, loadMyTasks, resetIfReady]
   );
 
   const submitForValidation = useCallback(
     async (repoName: string, conn: ConnectedRepo | undefined, task: TaskItem, myTask: MyTask) => {
       const key = `${repoName}::${task.name}`;
+      resetIfReady(repoName, task.name);
       if (!myTask?.id) {
         setEnvMsg((m) => ({ ...m, [key]: "Missing task id." }));
         return;
@@ -527,7 +562,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
         });
       }
     },
-    [manualToken, loadMyTasks]
+    [manualToken, loadMyTasks, resetIfReady]
   );
 
   // Clear the transient "submitting" flag once the server reflects the env
@@ -607,7 +642,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
         });
       }
     },
-    [manualToken, loadMyTasks]
+    [manualToken, loadMyTasks, resetIfReady]
   );
 
   const toggleArchive = useCallback(
@@ -659,39 +694,34 @@ export default function Gold({ manualToken }: { manualToken: string }) {
     }
   }, []);
 
-  // Load persisted "updating" task keys once on mount.
-  useEffect(() => {
+  // Poll task statuses from disk. On an updating/check → ready transition, also
+  // re-read that task's displayed data (e.g. a changed base_commit).
+  const pollStatuses = useCallback(async () => {
     try {
-      const saved = JSON.parse(localStorage.getItem("pluto.gold.updating") || "[]");
-      if (Array.isArray(saved)) setUpdating(new Set(saved as string[]));
+      const res = await fetch("/api/gold/statuses", { cache: "no-store" });
+      const data = await res.json();
+      if (!data.ok) return;
+      const next = data.statuses as Record<string, string>;
+      const prev = statusesRef.current;
+      for (const k of Object.keys(next)) {
+        const was = prev[k];
+        if ((was === "updating" || was === "check") && next[k] === "ready") {
+          const [repoName, taskFolder] = k.split("::");
+          refreshOneTask(repoName, taskFolder);
+        }
+      }
+      statusesRef.current = next;
+      setStatuses(next);
     } catch {
       /* ignore */
     }
-  }, []);
+  }, [refreshOneTask]);
 
-  const toggleUpdating = useCallback(
-    (key: string) => {
-      const wasChecked = updating.has(key);
-      setUpdating((prev) => {
-        const next = new Set(prev);
-        if (next.has(key)) next.delete(key);
-        else next.add(key);
-        try {
-          localStorage.setItem("pluto.gold.updating", JSON.stringify([...next]));
-        } catch {
-          /* ignore quota */
-        }
-        return next;
-      });
-      // On uncheck → re-read only THIS task's data from disk (e.g. a changed
-      // base_commit in task.toml.lines.txt); other tasks are left untouched.
-      if (wasChecked) {
-        const [repoName, taskFolder] = key.split("::");
-        refreshOneTask(repoName, taskFolder);
-      }
-    },
-    [updating, refreshOneTask]
-  );
+  useEffect(() => {
+    pollStatuses();
+    const id = setInterval(pollStatuses, 4000);
+    return () => clearInterval(id);
+  }, [pollStatuses]);
 
   const copyValue = useCallback(async (key: string, text: string) => {
     try {
@@ -714,7 +744,8 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   const categoryOf = useCallback(
     (r: RepoRow, t: TaskItem): string => {
       const key = `${r.name}::${t.name}`;
-      if (updating.has(key)) return "updating";
+      const st = statuses[key] ?? t.status ?? "idle";
+      if (st === "updating" || st === "check") return "updating";
       const conn = r.repoUrl ? connected.get(normUrl(r.repoUrl)) : undefined;
       const myTask = conn?.id ? myTasks.get(`${conn.id}::${t.taskName}`) : undefined;
       if (myTask) {
@@ -736,7 +767,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
       if ((envState === "none" || envState === "failed") && conn) return "add-env";
       return "other";
     },
-    [updating, connected, myTasks]
+    [statuses, connected, myTasks]
   );
 
   const archiveVisible = useCallback(
@@ -1114,6 +1145,8 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                           .filter((t) => archiveVisible(r, t) && matchesFilter(r, t))
                           .map((t) => {
                           const key = `${r.name}::${t.name}`;
+                          const taskStatus = statuses[key] ?? t.status ?? "idle";
+                          const locked = taskStatus === "updating" || taskStatus === "check";
                           const serverState = envStateFor(conn, t.baseCommit);
                           // Treat a just-submitted task as building until the
                           // server reflects it.
@@ -1166,19 +1199,21 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                               <td className="px-3 py-1.5 text-xs text-neutral-500">
                                 {fmtDate(t.modifiedMs)}
                               </td>
-                              <td className="px-3 py-1.5">
-                                <input
-                                  type="checkbox"
-                                  checked={updating.has(key)}
-                                  onChange={() => toggleUpdating(key)}
-                                  title="Mark this task as updating (disables its action buttons)"
-                                  className="h-4 w-4 accent-amber-600"
-                                />
+                              <td className="px-3 py-1.5" title={`status: ${taskStatus}`}>
+                                {taskStatus === "updating" ? (
+                                  <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-neutral-600 border-t-amber-400" />
+                                ) : taskStatus === "check" ? (
+                                  <span className="inline-block h-3 w-3 rounded-full bg-red-500 shadow-[0_0_6px] shadow-red-500/70" />
+                                ) : taskStatus === "ready" ? (
+                                  <span className="text-emerald-400">✓</span>
+                                ) : (
+                                  <span className="text-neutral-700">—</span>
+                                )}
                               </td>
                               <td className="px-3 py-1.5">
                                 <div
                                   className={`flex flex-col items-start gap-1.5 ${
-                                    updating.has(key) ? "pointer-events-none opacity-40" : ""
+                                    locked ? "pointer-events-none opacity-40" : ""
                                   }`}
                                 >
                                 {!isConnected ? (

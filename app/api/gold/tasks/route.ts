@@ -15,6 +15,20 @@ interface TaskItem {
   taskName: string;
   /** `<task>/.archived` marker exists → locally archived (hidden by default). */
   archived: boolean;
+  /** status from `<task>/data.txt` (idle | updating | check | ready). */
+  status: string;
+}
+
+/** Read `status = "..."` from a task's data.txt. Defaults to "idle". */
+async function readTaskStatus(taskPath: string): Promise<string> {
+  try {
+    const raw = await fs.readFile(path.join(taskPath, "data.txt"), "utf8");
+    const m = raw.match(/^\s*status\s*=\s*"?([A-Za-z_]+)"?/m);
+    if (m) return m[1];
+  } catch {
+    /* no data.txt → idle */
+  }
+  return "idle";
 }
 
 /** Read base_commit + task_name from a task's toml/config. */
@@ -90,6 +104,7 @@ export async function GET(req: NextRequest) {
         baseCommit: meta.baseCommit,
         taskName: meta.taskName,
         archived,
+        status: await readTaskStatus(taskPath),
       });
     }
     tasks.sort((a, b) => a.name.localeCompare(b.name));

@@ -59,6 +59,14 @@ export async function GET(req: NextRequest) {
       /* not archived */
     }
     const meta = await readTaskMeta(taskPath, task);
+    let status = "idle";
+    try {
+      const raw = await fs.readFile(path.join(taskPath, "data.txt"), "utf8");
+      const m = raw.match(/^\s*status\s*=\s*"?([A-Za-z_]+)"?/m);
+      if (m) status = m[1];
+    } catch {
+      /* no data.txt → idle */
+    }
     return NextResponse.json({
       ok: true,
       task: {
@@ -67,6 +75,7 @@ export async function GET(req: NextRequest) {
         baseCommit: meta.baseCommit,
         taskName: meta.taskName,
         archived,
+        status,
       },
     });
   } catch (e) {

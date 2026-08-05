@@ -162,7 +162,7 @@ export default function Home() {
   const [authRefreshing, setAuthRefreshing] = useState(false);
   const [view, setView] = useState<
     "tasks" | "submissions" | "rewrite" | "silver" | "fenrir" | "gold"
-  >("tasks");
+  >("gold");
 
   // Load persisted token + language.
   useEffect(() => {
@@ -623,7 +623,7 @@ export default function Home() {
 
       {/* View tabs */}
       <div className="mb-4 flex gap-1 border-b border-neutral-800 text-sm">
-        {(["tasks", "submissions", "rewrite", "silver", "fenrir", "gold"] as const).map((v) => (
+        {(["gold", "tasks", "submissions", "rewrite", "silver", "fenrir"] as const).map((v) => (
           <button
             key={v}
             onClick={() => setView(v)}
