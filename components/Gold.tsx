@@ -110,15 +110,15 @@ const COPY_STRIP =
   /\s*Instructions must be written by you\s*[—–-]\s*rewrite it in your own words and resubmit\.?/gi;
 
 /** Format ERROR messages for the clipboard (warnings excluded):
- *   Task: <task-name>
+ *   /fix Repo: <repo-name>, Task: <task-name>
  *   Error:
  *   <error message(s)>
  */
-function errorsToText(taskName: string, msgs: GoldMessage[]): string {
+function errorsToText(repoName: string, taskName: string, msgs: GoldMessage[]): string {
   const errors = msgs
     .filter((m) => m.level === "error")
     .map((m) => m.message.replace(COPY_STRIP, "").trim());
-  return `/fix Task: ${taskName}\nError:\n${errors.join("\n")}`;
+  return `/fix Repo: ${repoName}, Task: ${taskName}\nError:\n${errors.join("\n")}`;
 }
 
 /** A task is mid-validation while its status is "Validating" and not finished. */
@@ -220,10 +220,9 @@ const taskUrl = (id: string) => `https://experts.afterquery.com/projects/gold/ta
 /** Filter-board categories, mapped to a task's current action state. */
 const TASK_FILTERS: { key: string; label: string }[] = [
   { key: "all", label: "All" },
-  { key: "add-env", label: "Add environment" },
-  { key: "building", label: "Building" },
   { key: "new-task", label: "New task" },
   { key: "updating", label: "Updating" },
+  { key: "ready", label: "Ready" },
   { key: "submit", label: "Submit for validation" },
   { key: "validating", label: "Validating" },
   { key: "needs-review", label: "Needs review" },
@@ -257,6 +256,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   const [myTasks, setMyTasks] = useState<Map<string, MyTask>>(new Map());
   const [refreshedAt, setRefreshedAt] = useState(0); // last Reload click (epoch ms)
   const [showArchived, setShowArchived] = useState(false);
+  const [editStatus, setEditStatus] = useState(false); // show the status dropdown
   // Selected filter-board categories (multi-select). Empty = "All".
   const [filters, setFilters] = useState<Set<string>>(new Set());
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
@@ -734,8 +734,8 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   }, []);
 
   const copyMessages = useCallback(
-    (key: string, taskName: string, msgs: GoldMessage[]) =>
-      copyValue(key, errorsToText(taskName, msgs)),
+    (key: string, repoName: string, taskName: string, msgs: GoldMessage[]) =>
+      copyValue(key, errorsToText(repoName, taskName, msgs)),
     [copyValue]
   );
 
@@ -746,6 +746,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
       const key = `${r.name}::${t.name}`;
       const st = statuses[key] ?? t.status ?? "idle";
       if (st === "updating" || st === "check") return "updating";
+      if (st === "ready") return "ready";
       const conn = r.repoUrl ? connected.get(normUrl(r.repoUrl)) : undefined;
       const myTask = conn?.id ? myTasks.get(`${conn.id}::${t.taskName}`) : undefined;
       if (myTask) {
@@ -760,12 +761,10 @@ export default function Gold({ manualToken }: { manualToken: string }) {
           return "submit";
         return "other";
       }
-      const envState = envStateFor(conn, t.baseCommit);
-      if (envState === "building") return "building";
-      if (envState === "published") return "new-task";
-      // no env yet OR a failed build → needs (re)build.
-      if ((envState === "none" || envState === "failed") && conn) return "add-env";
-      return "other";
+      // Not created yet → the "new task" pipeline (add environment / building /
+      // published / failed build) is all combined under "new-task".
+      if (conn) return "new-task";
+      return "other"; // not connected
     },
     [statuses, connected, myTasks]
   );
@@ -898,6 +897,15 @@ export default function Gold({ manualToken }: { manualToken: string }) {
             className="h-3.5 w-3.5 accent-amber-600"
           />
           Show archived
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-neutral-400">
+          <input
+            type="checkbox"
+            checked={editStatus}
+            onChange={(e) => setEditStatus(e.target.checked)}
+            className="h-3.5 w-3.5 accent-amber-600"
+          />
+          Update status
         </label>
         {refreshedAt > 0 && (
           <span className="text-xs text-neutral-500">
@@ -1199,16 +1207,40 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                               <td className="px-3 py-1.5 text-xs text-neutral-500">
                                 {fmtDate(t.modifiedMs)}
                               </td>
-                              <td className="px-3 py-1.5" title={`status: ${taskStatus}`}>
-                                {taskStatus === "updating" ? (
-                                  <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-neutral-600 border-t-amber-400" />
-                                ) : taskStatus === "check" ? (
-                                  <span className="inline-block h-3 w-3 rounded-full bg-red-500 shadow-[0_0_6px] shadow-red-500/70" />
-                                ) : taskStatus === "ready" ? (
-                                  <span className="text-emerald-400">✓</span>
-                                ) : (
-                                  <span className="text-neutral-700">—</span>
-                                )}
+                              <td className="px-3 py-1.5">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="w-4 text-center">
+                                    {taskStatus === "updating" ? (
+                                      <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-neutral-600 border-t-amber-400 align-middle" />
+                                    ) : taskStatus === "check" ? (
+                                      <span className="inline-block h-3 w-3 rounded-full bg-red-500 align-middle shadow-[0_0_6px] shadow-red-500/70" />
+                                    ) : taskStatus === "ready" ? (
+                                      <span className="text-emerald-400">✓</span>
+                                    ) : (
+                                      <span className="text-neutral-700">—</span>
+                                    )}
+                                  </span>
+                                  {editStatus && (
+                                    <select
+                                      value={taskStatus}
+                                      onChange={(e) => {
+                                        const ns = e.target.value;
+                                        const was = taskStatus;
+                                        setTaskStatus(r.name, t.name, ns);
+                                        if ((was === "updating" || was === "check") && ns === "ready") {
+                                          refreshOneTask(r.name, t.name);
+                                        }
+                                      }}
+                                      title="Change task status"
+                                      className="rounded border border-neutral-700 bg-neutral-950 px-1 py-0.5 text-[10px] text-neutral-300 outline-none focus:border-amber-600"
+                                    >
+                                      <option value="idle">idle</option>
+                                      <option value="updating">updating</option>
+                                      <option value="check">check</option>
+                                      <option value="ready">ready</option>
+                                    </select>
+                                  )}
+                                </div>
                               </td>
                               <td className="px-3 py-1.5">
                                 <div
@@ -1389,7 +1421,7 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                 {myTask && errorMsgs.length > 0 ? (
                                   <div className="group relative inline-block">
                                     <button
-                                      onClick={() => copyMessages(key, t.name, myTask.messages)}
+                                      onClick={() => copyMessages(key, r.name, t.name, myTask.messages)}
                                       title="Copy error messages"
                                       className="inline-flex h-6 w-6 items-center justify-center rounded border border-neutral-700 text-red-300 hover:bg-neutral-800"
                                     >
