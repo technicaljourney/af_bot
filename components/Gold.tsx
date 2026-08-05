@@ -260,6 +260,9 @@ export default function Gold({ manualToken }: { manualToken: string }) {
   // Selected filter-board categories (multi-select). Empty = "All".
   const [filters, setFilters] = useState<Set<string>>(new Set());
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  // Pre-submit rule failures ("rules not met"), as copyable error messages,
+  // keyed by `${repo}::${task}`.
+  const [ruleMsgs, setRuleMsgs] = useState<Record<string, GoldMessage[]>>({});
   // Real-time task statuses from result/<repo>/tasks/<task>/data.txt, keyed by
   // `${repo}::${task}` (idle | updating | check | ready). Polled live.
   const [statuses, setStatuses] = useState<Record<string, string>>({});
@@ -542,13 +545,29 @@ export default function Gold({ manualToken }: { manualToken: string }) {
         if (!data.ok) throw new Error(data.error || "Submit failed");
         if (data.submitted) {
           setEnvMsg((m) => ({ ...m, [key]: "Submitted for validation ✓" }));
+          setRuleMsgs((m) => {
+            const n = { ...m };
+            delete n[key];
+            return n;
+          });
         } else {
-          const failed = (data.rules || [])
-            .filter((r: { pass: boolean }) => !r.pass)
-            .map((r: { name: string; actual: number }) => `${r.name}=${r.actual}`);
+          type Rule = { name: string; actual: number; min?: number; max?: number; pass: boolean };
+          const failedRules = (data.rules || []).filter((r: Rule) => !r.pass) as Rule[];
           setEnvMsg((m) => ({
             ...m,
-            [key]: `Saved, but rules not met: ${failed.join(", ")}`,
+            [key]: `Saved, but rules not met: ${failedRules
+              .map((r) => `${r.name}=${r.actual}`)
+              .join(", ")}`,
+          }));
+          setRuleMsgs((m) => ({
+            ...m,
+            [key]: failedRules.map((r) => ({
+              scope: "Rules",
+              level: "error",
+              message: `${r.name} = ${r.actual}${r.min != null ? ` (min ${r.min})` : ""}${
+                r.max != null ? ` (max ${r.max})` : ""
+              }`,
+            })),
           }));
         }
         await loadMyTasks();
@@ -1173,9 +1192,10 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                               myTask.baseSha &&
                               myTask.baseSha.toLowerCase() !== t.baseCommit.toLowerCase()
                           );
-                          const errorMsgs = myTask
-                            ? myTask.messages.filter((m) => m.level === "error")
-                            : [];
+                          const errorMsgs = [
+                            ...(myTask ? myTask.messages.filter((m) => m.level === "error") : []),
+                            ...(ruleMsgs[key] || []),
+                          ];
                           return (
                             <tr
                               key={key}
@@ -1418,10 +1438,15 @@ export default function Gold({ manualToken }: { manualToken: string }) {
                                 </div>
                               </td>
                               <td className="px-3 py-1.5">
-                                {myTask && errorMsgs.length > 0 ? (
+                                {errorMsgs.length > 0 ? (
                                   <div className="group relative inline-block">
                                     <button
-                                      onClick={() => copyMessages(key, r.name, t.name, myTask.messages)}
+                                      onClick={() =>
+                                        copyMessages(key, r.name, t.name, [
+                                          ...(myTask?.messages || []),
+                                          ...(ruleMsgs[key] || []),
+                                        ])
+                                      }
                                       title="Copy error messages"
                                       className="inline-flex h-6 w-6 items-center justify-center rounded border border-neutral-700 text-red-300 hover:bg-neutral-800"
                                     >
